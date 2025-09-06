@@ -170,3 +170,7 @@ Special thanks to:
 -   Paul Hubbard for initial packaging support.
 
 [![Redis](./docs/_static/logo-redis.svg)](https://redis.io)
+
+-------
+
+Check CI
