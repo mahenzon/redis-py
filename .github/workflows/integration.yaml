@@ -27,29 +27,34 @@ env:
   CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
   # this speeds up coverage with Python 3.12: https://github.com/nedbat/coveragepy/issues/1665
   COVERAGE_CORE: sysmon
-  CURRENT_CLIENT_LIBS_TEST_STACK_IMAGE_TAG: 'rs-7.4.0-v2'
-  CURRENT_REDIS_VERSION: '7.4.2'
+  # patch releases get included in the base version image when they are published
+  # for example after 8.2.1 is published, 8.2 image contains 8.2.1 content
+  CURRENT_CLIENT_LIBS_TEST_STACK_IMAGE_TAG: '8.4.0'
+  CURRENT_REDIS_VERSION: '8.4.0'
+  REDIS_VERSION_CUSTOM_MAP: 'custom-21860421418-debian-amd64:8.6'
 
 jobs:
   dependency-audit:
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: pypa/gh-action-pip-audit@v1.0.8
         with:
           inputs: dev_requirements.txt
           ignore-vulns: |
             GHSA-w596-4wvx-j9j6  # subversion related git pull, dependency for pytest. There is no impact here.
+            CVE-2026-26007 # dependency for entraid tests
+            CVE-2026-32597 # PyJWT does not validate the crit (Critical) Header Parameter defined in RFC 7515, this will be fixed in the next release
 
   lint:
     name: Code linters
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
-          python-version: 3.9
+          python-version: "3.10"
           cache: 'pip'
       - name: run code linters
         run: |
@@ -71,67 +76,101 @@ jobs:
     timeout-minutes: 60
     needs: redis_version
     strategy:
-      max-parallel: 15
+      max-parallel: 30
       fail-fast: false
       matrix:
-        redis-version: ['8.0-RC2-pre', '${{ needs.redis_version.outputs.CURRENT }}', '7.2.7', '6.2.17']
-        python-version: ['3.8', '3.13']
+        redis-version: ['custom-21860421418-debian-amd64', '${{ needs.redis_version.outputs.CURRENT }}', '8.2', '8.0.2' ,'7.4.4', '7.2.9']
+        python-version: ['3.10', '3.14']
         parser-backend: ['plain']
         event-loop: ['asyncio']
+        protocol: ['2', '3']
     env:
       ACTIONS_ALLOW_UNSECURE_COMMANDS: true
-    name: Redis ${{ matrix.redis-version }}; Python ${{ matrix.python-version }}; RESP Parser:${{matrix.parser-backend}}; EL:${{matrix.event-loop}}
+    name: Redis ${{ matrix.redis-version }}; Python ${{ matrix.python-version }}; RESP Parser:${{matrix.parser-backend}}; EL:${{matrix.event-loop}}; Protocol:${{matrix.protocol}}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run tests
         uses: ./.github/actions/run-tests
         with:
             python-version: ${{ matrix.python-version }}
             parser-backend: ${{ matrix.parser-backend }}
             redis-version: ${{ matrix.redis-version }}
+            protocol: ${{ matrix.protocol }}
 
   python-compatibility-tests:
     runs-on: ubuntu-latest
-    needs: [ redis_version, tests ]
+    needs: [ redis_version ]
     timeout-minutes: 60
     strategy:
-      max-parallel: 15
+      max-parallel: 30
       fail-fast: false
       matrix:
         redis-version: [ '${{ needs.redis_version.outputs.CURRENT }}' ]
-        python-version: ['3.9', '3.10', '3.11', '3.12', 'pypy-3.9', 'pypy-3.10']
+        python-version: ['3.11', '3.12', '3.13']
         parser-backend: [ 'plain' ]
         event-loop: [ 'asyncio' ]
+        protocol: ['2', '3']
     env:
       ACTIONS_ALLOW_UNSECURE_COMMANDS: true
-    name: Redis ${{ matrix.redis-version }}; Python ${{ matrix.python-version }}; RESP Parser:${{matrix.parser-backend}}; EL:${{matrix.event-loop}}
+    name: Redis ${{ matrix.redis-version }}; Python ${{ matrix.python-version }}; RESP Parser:${{matrix.parser-backend}}; EL:${{matrix.event-loop}}; Protocol:${{matrix.protocol}}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run tests
         uses: ./.github/actions/run-tests
         with:
           python-version: ${{ matrix.python-version }}
           parser-backend: ${{ matrix.parser-backend }}
           redis-version: ${{ matrix.redis-version }}
+          protocol: ${{ matrix.protocol }}
 
-  hiredis-tests:
+  pypy-compatibility-tests:
     runs-on: ubuntu-latest
-    needs: [redis_version, tests]
-    timeout-minutes: 60
+    needs: [ redis_version ]
+    # in pipeline ofter these pypy jobs hang, so their timeout is set
+    # to just 50 minutes - close to the max time the jobs are running at the moment
+    # adding more tests will make them even slower, and we will need to adjust the timeout
+    timeout-minutes: 50
     strategy:
-      max-parallel: 15
+      max-parallel: 30
       fail-fast: false
       matrix:
         redis-version: [ '${{ needs.redis_version.outputs.CURRENT }}' ]
-        python-version: [ '3.8', '3.13']
-        parser-backend: [ 'hiredis' ]
-        hiredis-version: [ '>=3.0.0', '<3.0.0' ]
+        python-version: ['pypy-3.10', 'pypy-3.11']
+        parser-backend: [ 'plain' ]
         event-loop: [ 'asyncio' ]
+        protocol: ['2', '3']
     env:
       ACTIONS_ALLOW_UNSECURE_COMMANDS: true
-    name: Redis ${{ matrix.redis-version }}; Python ${{ matrix.python-version }}; RESP Parser:${{matrix.parser-backend}} (${{ matrix.hiredis-version }}); EL:${{matrix.event-loop}}
+    name: PyPy Redis ${{ matrix.redis-version }}; ${{ matrix.python-version }}; RESP Parser:${{matrix.parser-backend}}; EL:${{matrix.event-loop}}; Protocol:${{matrix.protocol}}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - name: Run tests
+        uses: ./.github/actions/run-tests
+        with:
+          python-version: ${{ matrix.python-version }}
+          parser-backend: ${{ matrix.parser-backend }}
+          redis-version: ${{ matrix.redis-version }}
+          protocol: ${{ matrix.protocol }}
+
+  hiredis-tests:
+    runs-on: ubuntu-latest
+    needs: [redis_version]
+    timeout-minutes: 60
+    strategy:
+      max-parallel: 30
+      fail-fast: false
+      matrix:
+        redis-version: [ '${{ needs.redis_version.outputs.CURRENT }}' ]
+        python-version: [ '3.10', '3.14']
+        parser-backend: [ 'hiredis' ]
+        hiredis-version: [ '>=3.2.0', '<3.0.0' ]
+        event-loop: [ 'asyncio' ]
+        protocol: ['2', '3']
+    env:
+      ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+    name: Redis ${{ matrix.redis-version }}; Python ${{ matrix.python-version }}; RESP Parser:${{matrix.parser-backend}} (${{ matrix.hiredis-version }}); EL:${{matrix.event-loop}}; Protocol:${{matrix.protocol}}
+    steps:
+      - uses: actions/checkout@v6
       - name: Run tests
         uses: ./.github/actions/run-tests
         with:
@@ -139,24 +178,26 @@ jobs:
           parser-backend: ${{ matrix.parser-backend }}
           redis-version: ${{ matrix.redis-version }}
           hiredis-version: ${{ matrix.hiredis-version }}
+          protocol: ${{ matrix.protocol }}
 
   uvloop-tests:
     runs-on: ubuntu-latest
-    needs: [redis_version, tests]
+    needs: [redis_version]
     timeout-minutes: 60
     strategy:
-      max-parallel: 15
+      max-parallel: 30
       fail-fast: false
       matrix:
         redis-version: [ '${{ needs.redis_version.outputs.CURRENT }}' ]
-        python-version: [ '3.8', '3.13' ]
+        python-version: [ '3.10', '3.14' ]
         parser-backend: [ 'plain' ]
         event-loop: [ 'uvloop' ]
+        protocol: ['2', '3']
     env:
       ACTIONS_ALLOW_UNSECURE_COMMANDS: true
-    name: Redis ${{ matrix.redis-version }}; Python ${{ matrix.python-version }}; RESP Parser:${{matrix.parser-backend}}; EL:${{matrix.event-loop}}
+    name: Redis ${{ matrix.redis-version }}; Python ${{ matrix.python-version }}; RESP Parser:${{matrix.parser-backend}}; EL:${{matrix.event-loop}}; Protocol:${{matrix.protocol}}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run tests
         uses: ./.github/actions/run-tests
         with:
@@ -164,20 +205,21 @@ jobs:
           parser-backend: ${{ matrix.parser-backend }}
           redis-version: ${{ matrix.redis-version }}
           event-loop: ${{ matrix.event-loop }}
+          protocol: ${{ matrix.protocol }}
 
   build-and-test-package:
     name: Validate building and installing the package
     runs-on: ubuntu-latest
-    needs: [tests]
+    needs: [redis_version]
     strategy:
       fail-fast: false
       matrix:
         extension: ['tar.gz', 'whl']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
-          python-version: 3.9
+          python-version: "3.10"
       - name: Run installed unit tests
         env:
           CLIENT_LIBS_TEST_IMAGE_TAG: ${{ env.CURRENT_REDIS_VERSION }}
@@ -191,10 +233,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13', 'pypy-3.9', 'pypy-3.10']
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14', 'pypy-3.10', 'pypy-3.11']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'

@@ -137,11 +137,11 @@ def parse_sentinel_state(item):
     return result
 
 
-def parse_sentinel_master(response):
+def parse_sentinel_master(response, **options):
     return parse_sentinel_state(map(str_if_bytes, response))
 
 
-def parse_sentinel_state_resp3(response):
+def parse_sentinel_state_resp3(response, **options):
     result = {}
     for key in response:
         try:
@@ -154,7 +154,7 @@ def parse_sentinel_state_resp3(response):
     return result
 
 
-def parse_sentinel_masters(response):
+def parse_sentinel_masters(response, **options):
     result = {}
     for item in response:
         state = parse_sentinel_state(map(str_if_bytes, item))
@@ -162,19 +162,19 @@ def parse_sentinel_masters(response):
     return result
 
 
-def parse_sentinel_masters_resp3(response):
-    return [parse_sentinel_state(master) for master in response]
+def parse_sentinel_masters_resp3(response, **options):
+    return [parse_sentinel_state_resp3(master) for master in response]
 
 
-def parse_sentinel_slaves_and_sentinels(response):
+def parse_sentinel_slaves_and_sentinels(response, **options):
     return [parse_sentinel_state(map(str_if_bytes, item)) for item in response]
 
 
-def parse_sentinel_slaves_and_sentinels_resp3(response):
-    return [parse_sentinel_state_resp3(item) for item in response]
+def parse_sentinel_slaves_and_sentinels_resp3(response, **options):
+    return [parse_sentinel_state_resp3(item, **options) for item in response]
 
 
-def parse_sentinel_get_master(response):
+def parse_sentinel_get_master(response, **options):
     return response and (response[0], int(response[1])) or None
 
 
@@ -224,6 +224,39 @@ def zset_score_pairs(response, **options):
     return list(zip(it, map(score_cast_func, it)))
 
 
+def zset_score_for_rank(response, **options):
+    """
+    If ``withscores`` is specified in the options, return the response as
+    a [value, score] pair
+    """
+    if not response or not options.get("withscore"):
+        return response
+    score_cast_func = options.get("score_cast_func", float)
+    return [response[0], score_cast_func(response[1])]
+
+
+def zset_score_pairs_resp3(response, **options):
+    """
+    If ``withscores`` is specified in the options, return the response as
+    a list of [value, score] pairs
+    """
+    if not response or not options.get("withscores"):
+        return response
+    score_cast_func = options.get("score_cast_func", float)
+    return [[name, score_cast_func(val)] for name, val in response]
+
+
+def zset_score_for_rank_resp3(response, **options):
+    """
+    If ``withscores`` is specified in the options, return the response as
+    a [value, score] pair
+    """
+    if not response or not options.get("withscore"):
+        return response
+    score_cast_func = options.get("score_cast_func", float)
+    return [response[0], score_cast_func(response[1])]
+
+
 def sort_return_tuples(response, **options):
     """
     If ``groups`` is specified, return the response as a list of
@@ -235,13 +268,16 @@ def sort_return_tuples(response, **options):
     return list(zip(*[response[i::n] for i in range(n)]))
 
 
-def parse_stream_list(response):
+def parse_stream_list(response, **options):
     if response is None:
         return None
     data = []
     for r in response:
         if r is not None:
-            data.append((r[0], pairs_to_dict(r[1])))
+            if "claim_min_idle_time" in options:
+                data.append((r[0], pairs_to_dict(r[1]), *r[2:]))
+            else:
+                data.append((r[0], pairs_to_dict(r[1])))
         else:
             data.append((None, None))
     return data
@@ -299,16 +335,18 @@ def parse_xinfo_stream(response, **options):
     return data
 
 
-def parse_xread(response):
+def parse_xread(response, **options):
     if response is None:
         return []
-    return [[r[0], parse_stream_list(r[1])] for r in response]
+    return [[r[0], parse_stream_list(r[1], **options)] for r in response]
 
 
-def parse_xread_resp3(response):
+def parse_xread_resp3(response, **options):
     if response is None:
         return {}
-    return {key: [parse_stream_list(value)] for key, value in response.items()}
+    return {
+        key: [parse_stream_list(value, **options)] for key, value in response.items()
+    }
 
 
 def parse_xpending(response, **options):
@@ -349,8 +387,22 @@ def parse_zadd(response, **options):
 def parse_client_list(response, **options):
     clients = []
     for c in str_if_bytes(response).splitlines():
-        # Values might contain '='
-        clients.append(dict(pair.split("=", 1) for pair in c.split(" ")))
+        client_dict = {}
+        tokens = c.split(" ")
+        last_key = None
+        for token in tokens:
+            if "=" in token:
+                # Values might contain '='
+                key, value = token.split("=", 1)
+                client_dict[key] = value
+                last_key = key
+            else:
+                # Values may include spaces. For instance, when running Redis via a Unix socket — such as
+                # "/tmp/redis sock/redis.sock" — the addr or laddr field will include a space.
+                client_dict[last_key] += " " + token
+
+        if client_dict:
+            clients.append(client_dict)
     return clients
 
 
@@ -676,7 +728,8 @@ def parse_client_info(value):
         "omem",
         "tot-mem",
     }:
-        client_info[int_key] = int(client_info[int_key])
+        if int_key in client_info:
+            client_info[int_key] = int(client_info[int_key])
     return client_info
 
 
@@ -701,7 +754,7 @@ def string_keys_to_dict(key_string, callback):
 _RedisCallbacks = {
     **string_keys_to_dict(
         "AUTH COPY EXPIRE EXPIREAT HEXISTS HMSET MOVE MSETNX PERSIST PSETEX "
-        "PEXPIRE PEXPIREAT RENAMENX SETEX SETNX SMOVE",
+        "PEXPIRE PEXPIREAT RENAMENX SETEX SETNX SMOVE HSETNX SISMEMBER",
         bool,
     ),
     **string_keys_to_dict("HINCRBYFLOAT INCRBYFLOAT", float),
@@ -750,6 +803,7 @@ _RedisCallbacks = {
     "FUNCTION DELETE": bool_ok,
     "FUNCTION FLUSH": bool_ok,
     "FUNCTION RESTORE": bool_ok,
+    "RESTORE": bool_ok,
     "GEODIST": float_or_none,
     "HSCAN": parse_hscan,
     "INFO": parse_info,
@@ -777,6 +831,7 @@ _RedisCallbacks = {
     "SENTINEL SET": bool_ok,
     "SLOWLOG GET": parse_slowlog_get,
     "SLOWLOG RESET": bool_ok,
+    "SMISMEMBER": lambda r: list(map(bool, r)),
     "SORT": sort_return_tuples,
     "SSCAN": parse_scan,
     "TIME": lambda x: (int(x[0]), int(x[1])),
@@ -796,9 +851,13 @@ _RedisCallbacksRESP2 = {
         "SDIFF SINTER SMEMBERS SUNION", lambda r: r and set(r) or set()
     ),
     **string_keys_to_dict(
-        "ZDIFF ZINTER ZPOPMAX ZPOPMIN ZRANGE ZRANGEBYSCORE ZRANK ZREVRANGE "
-        "ZREVRANGEBYSCORE ZREVRANK ZUNION",
+        "ZDIFF ZINTER ZPOPMAX ZPOPMIN ZRANGE ZRANGEBYSCORE ZREVRANGE "
+        "ZREVRANGEBYSCORE ZUNION",
         zset_score_pairs,
+    ),
+    **string_keys_to_dict(
+        "ZREVRANK ZRANK",
+        zset_score_for_rank,
     ),
     **string_keys_to_dict("ZINCRBY ZSCORE", float_or_none),
     **string_keys_to_dict("BGREWRITEAOF BGSAVE", lambda r: True),
@@ -823,6 +882,7 @@ _RedisCallbacksRESP2 = {
         map(lambda ll: (float(ll[0]), float(ll[1])) if ll is not None else None, r)
     ),
     "HGETALL": lambda r: r and pairs_to_dict(r) or {},
+    "HOTKEYS GET": lambda r: [pairs_to_dict(m) for m in r],
     "MEMORY STATS": parse_memory_stats,
     "MODULE LIST": lambda r: [pairs_to_dict(m) for m in r],
     "RESET": str_if_bytes,
@@ -830,6 +890,7 @@ _RedisCallbacksRESP2 = {
     "SENTINEL MASTERS": parse_sentinel_masters,
     "SENTINEL SENTINELS": parse_sentinel_slaves_and_sentinels,
     "SENTINEL SLAVES": parse_sentinel_slaves_and_sentinels,
+    "SMISMEMBER": lambda r: list(map(bool, r)),
     "STRALGO": parse_stralgo,
     "XINFO CONSUMERS": parse_list_of_dicts,
     "XINFO GROUPS": parse_list_of_dicts,
@@ -843,9 +904,16 @@ _RedisCallbacksRESP3 = {
         "SDIFF SINTER SMEMBERS SUNION", lambda r: r and set(r) or set()
     ),
     **string_keys_to_dict(
-        "ZRANGE ZINTER ZPOPMAX ZPOPMIN ZRANGEBYSCORE ZREVRANGE ZREVRANGEBYSCORE "
-        "ZUNION HGETALL XREADGROUP",
+        "ZRANGE ZINTER ZPOPMAX ZPOPMIN HGETALL XREADGROUP",
         lambda r, **kwargs: r,
+    ),
+    **string_keys_to_dict(
+        "ZRANGE ZRANGEBYSCORE ZREVRANGE ZREVRANGEBYSCORE ZUNION",
+        zset_score_pairs_resp3,
+    ),
+    **string_keys_to_dict(
+        "ZREVRANK ZRANK",
+        zset_score_for_rank_resp3,
     ),
     **string_keys_to_dict("XREAD XREADGROUP", parse_xread_resp3),
     "ACL LOG": lambda r: (
@@ -868,6 +936,7 @@ _RedisCallbacksRESP3 = {
     "SENTINEL MASTERS": parse_sentinel_masters_resp3,
     "SENTINEL SENTINELS": parse_sentinel_slaves_and_sentinels_resp3,
     "SENTINEL SLAVES": parse_sentinel_slaves_and_sentinels_resp3,
+    "SMISMEMBER": lambda r: list(map(bool, r)),
     "STRALGO": lambda r, **options: (
         {str_if_bytes(key): str_if_bytes(value) for key, value in r.items()}
         if isinstance(r, dict)

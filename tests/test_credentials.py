@@ -4,14 +4,17 @@ import string
 import threading
 from time import sleep
 from typing import Optional, Tuple, Union
+from unittest.mock import Mock, call
 
 import pytest
 import redis
-from mock.mock import Mock, call
 from redis import AuthenticationError, DataError, Redis, ResponseError
 from redis.auth.err import RequestTokenErr
 from redis.backoff import NoBackoff
-from redis.connection import ConnectionInterface, ConnectionPool
+from redis.connection import (
+    ConnectionInterface,
+    ConnectionPool,
+)
 from redis.credentials import CredentialProvider, UsernamePasswordCredentialProvider
 from redis.exceptions import ConnectionError, RedisError
 from redis.retry import Retry
@@ -316,14 +319,20 @@ class TestStreamingCredentialProvider:
     def test_re_auth_all_connections(self, credential_provider):
         mock_connection = Mock(spec=ConnectionInterface)
         mock_connection.retry = Retry(NoBackoff(), 0)
+        mock_connection.host = "localhost"
+        mock_connection.port = 6379
+        mock_connection.db = 0
         mock_another_connection = Mock(spec=ConnectionInterface)
+        mock_another_connection.host = "localhost"
+        mock_another_connection.port = 6379
+        mock_another_connection.db = 0
         mock_pool = Mock(spec=ConnectionPool)
         mock_pool.connection_kwargs = {
             "credential_provider": credential_provider,
         }
         mock_pool.get_connection.return_value = mock_connection
         mock_pool._available_connections = [mock_connection, mock_another_connection]
-        mock_pool._lock = threading.Lock()
+        mock_pool._lock = threading.RLock()
         auth_token = None
 
         def re_auth_callback(token):
@@ -365,13 +374,22 @@ class TestStreamingCredentialProvider:
     def test_re_auth_partial_connections(self, credential_provider):
         mock_connection = Mock(spec=ConnectionInterface)
         mock_connection.retry = Retry(NoBackoff(), 3)
+        mock_connection.host = "localhost"
+        mock_connection.port = 6379
+        mock_connection.db = 0
         mock_another_connection = Mock(spec=ConnectionInterface)
         mock_another_connection.retry = Retry(NoBackoff(), 3)
+        mock_another_connection.host = "localhost"
+        mock_another_connection.port = 6379
+        mock_another_connection.db = 0
         mock_failed_connection = Mock(spec=ConnectionInterface)
         mock_failed_connection.read_response.side_effect = ConnectionError(
             "Failed auth"
         )
         mock_failed_connection.retry = Retry(NoBackoff(), 3)
+        mock_failed_connection.host = "localhost"
+        mock_failed_connection.port = 6379
+        mock_failed_connection.db = 0
         mock_pool = Mock(spec=ConnectionPool)
         mock_pool.connection_kwargs = {
             "credential_provider": credential_provider,
@@ -382,7 +400,7 @@ class TestStreamingCredentialProvider:
             mock_another_connection,
             mock_failed_connection,
         ]
-        mock_pool._lock = threading.Lock()
+        mock_pool._lock = threading.RLock()
 
         def _raise(error: RedisError):
             pass
@@ -428,10 +446,17 @@ class TestStreamingCredentialProvider:
     def test_re_auth_pub_sub_in_resp3(self, credential_provider):
         mock_pubsub_connection = Mock(spec=ConnectionInterface)
         mock_pubsub_connection.get_protocol.return_value = 3
+        mock_pubsub_connection.should_reconnect = Mock(return_value=False)
         mock_pubsub_connection.credential_provider = credential_provider
         mock_pubsub_connection.retry = Retry(NoBackoff(), 3)
+        mock_pubsub_connection.host = "localhost"
+        mock_pubsub_connection.port = 6379
+        mock_pubsub_connection.db = 0
         mock_another_connection = Mock(spec=ConnectionInterface)
         mock_another_connection.retry = Retry(NoBackoff(), 3)
+        mock_another_connection.host = "localhost"
+        mock_another_connection.port = 6379
+        mock_another_connection.db = 0
 
         mock_pool = Mock(spec=ConnectionPool)
         mock_pool.connection_kwargs = {
@@ -442,7 +467,7 @@ class TestStreamingCredentialProvider:
             mock_another_connection,
         ]
         mock_pool._available_connections = [mock_another_connection]
-        mock_pool._lock = threading.Lock()
+        mock_pool._lock = threading.RLock()
         auth_token = None
 
         def re_auth_callback(token):
@@ -488,10 +513,17 @@ class TestStreamingCredentialProvider:
     def test_do_not_re_auth_pub_sub_in_resp2(self, credential_provider):
         mock_pubsub_connection = Mock(spec=ConnectionInterface)
         mock_pubsub_connection.get_protocol.return_value = 2
+        mock_pubsub_connection.should_reconnect = Mock(return_value=False)
         mock_pubsub_connection.credential_provider = credential_provider
         mock_pubsub_connection.retry = Retry(NoBackoff(), 3)
+        mock_pubsub_connection.host = "localhost"
+        mock_pubsub_connection.port = 6379
+        mock_pubsub_connection.db = 0
         mock_another_connection = Mock(spec=ConnectionInterface)
         mock_another_connection.retry = Retry(NoBackoff(), 3)
+        mock_another_connection.host = "localhost"
+        mock_another_connection.port = 6379
+        mock_another_connection.db = 0
 
         mock_pool = Mock(spec=ConnectionPool)
         mock_pool.connection_kwargs = {
@@ -502,7 +534,7 @@ class TestStreamingCredentialProvider:
             mock_another_connection,
         ]
         mock_pool._available_connections = [mock_another_connection]
-        mock_pool._lock = threading.Lock()
+        mock_pool._lock = threading.RLock()
         auth_token = None
 
         def re_auth_callback(token):
@@ -553,14 +585,20 @@ class TestStreamingCredentialProvider:
         ]
         mock_connection = Mock(spec=ConnectionInterface)
         mock_connection.retry = Retry(NoBackoff(), 0)
+        mock_connection.host = "localhost"
+        mock_connection.port = 6379
+        mock_connection.db = 0
         mock_another_connection = Mock(spec=ConnectionInterface)
+        mock_another_connection.host = "localhost"
+        mock_another_connection.port = 6379
+        mock_another_connection.db = 0
         mock_pool = Mock(spec=ConnectionPool)
         mock_pool.connection_kwargs = {
             "credential_provider": credential_provider,
         }
         mock_pool.get_connection.return_value = mock_connection
         mock_pool._available_connections = [mock_connection, mock_another_connection]
-        mock_pool._lock = threading.Lock()
+        mock_pool._lock = threading.RLock()
 
         Redis(
             connection_pool=mock_pool,

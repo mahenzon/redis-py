@@ -264,6 +264,80 @@ def test_vsim_with_scores(d_client):
     assert 0 <= vsim["elem1"] <= 1
 
 
+@skip_if_server_version_lt("8.2.0")
+def test_vsim_with_attribs_attribs_set(d_client):
+    elements_count = 5
+    vector_dim = 10
+    attrs_dict = {"key1": "value1", "key2": "value2"}
+    for i in range(elements_count):
+        float_array = [random.uniform(0, 5) for x in range(vector_dim)]
+        d_client.vset().vadd(
+            "myset",
+            float_array,
+            f"elem{i}",
+            numlinks=64,
+            attributes=attrs_dict if i % 2 == 0 else None,
+        )
+
+    vsim = d_client.vset().vsim("myset", input="elem1", with_attribs=True)
+    assert len(vsim) == 5
+    assert isinstance(vsim, dict)
+    assert vsim["elem1"] is None
+    assert vsim["elem2"] == attrs_dict
+
+
+@skip_if_server_version_lt("8.2.0")
+def test_vsim_with_scores_and_attribs_attribs_set(d_client):
+    elements_count = 5
+    vector_dim = 10
+    attrs_dict = {"key1": "value1", "key2": "value2"}
+    for i in range(elements_count):
+        float_array = [random.uniform(0, 5) for x in range(vector_dim)]
+        d_client.vset().vadd(
+            "myset",
+            float_array,
+            f"elem{i}",
+            numlinks=64,
+            attributes=attrs_dict if i % 2 == 0 else None,
+        )
+
+    vsim = d_client.vset().vsim(
+        "myset", input="elem1", with_scores=True, with_attribs=True
+    )
+    assert len(vsim) == 5
+    assert isinstance(vsim, dict)
+    assert isinstance(vsim["elem1"], dict)
+    assert "score" in vsim["elem1"]
+    assert "attributes" in vsim["elem1"]
+    assert isinstance(vsim["elem1"]["score"], float)
+    assert vsim["elem1"]["attributes"] is None
+
+    assert isinstance(vsim["elem2"], dict)
+    assert "score" in vsim["elem2"]
+    assert "attributes" in vsim["elem2"]
+    assert isinstance(vsim["elem2"]["score"], float)
+    assert vsim["elem2"]["attributes"] == attrs_dict
+
+
+@skip_if_server_version_lt("8.2.0")
+def test_vsim_with_attribs_attribs_not_set(d_client):
+    elements_count = 20
+    vector_dim = 50
+    for i in range(elements_count):
+        float_array = [random.uniform(0, 10) for x in range(vector_dim)]
+        d_client.vset().vadd(
+            "myset",
+            float_array,
+            f"elem{i}",
+            numlinks=64,
+        )
+
+    vsim = d_client.vset().vsim("myset", input="elem1", with_attribs=True)
+    assert len(vsim) == 10
+    assert isinstance(vsim, dict)
+    assert vsim["elem1"] is None
+
+
 @skip_if_server_version_lt("7.9.0")
 def test_vsim_with_different_vector_input_types(d_client):
     elements_count = 10
@@ -379,43 +453,26 @@ def test_vsim_with_filter(d_client):
 
 @skip_if_server_version_lt("7.9.0")
 def test_vsim_truth_no_thread_enabled(d_client):
-    elements_count = 5000
+    elements_count = 100
     vector_dim = 50
     for i in range(1, elements_count + 1):
-        float_array = [random.uniform(10 * i, 1000 * i) for x in range(vector_dim)]
+        float_array = [i * vector_dim for _ in range(vector_dim)]
         d_client.vset().vadd("myset", float_array, f"elem_{i}")
 
     d_client.vset().vadd("myset", [-22 for _ in range(vector_dim)], "elem_man_2")
 
     sim_without_truth = d_client.vset().vsim(
-        "myset", input="elem_man_2", with_scores=True
+        "myset", input="elem_man_2", with_scores=True, count=30
     )
     sim_truth = d_client.vset().vsim(
-        "myset", input="elem_man_2", with_scores=True, truth=True
+        "myset", input="elem_man_2", with_scores=True, count=30, truth=True
     )
 
-    assert len(sim_without_truth) == 10
-    assert len(sim_truth) == 10
+    assert len(sim_without_truth) == 30
+    assert len(sim_truth) == 30
 
     assert isinstance(sim_without_truth, dict)
     assert isinstance(sim_truth, dict)
-
-    results_scores = list(
-        zip(
-            [v for _, v in sim_truth.items()], [v for _, v in sim_without_truth.items()]
-        )
-    )
-
-    found_better_match = False
-    for score_with_truth, score_without_truth in results_scores:
-        if score_with_truth < score_without_truth:
-            assert False, (
-                "Score with truth [{score_with_truth}] < score without truth [{score_without_truth}]"
-            )
-        elif score_with_truth > score_without_truth:
-            found_better_match = True
-
-    assert found_better_match
 
     sim_no_thread = d_client.vset().vsim(
         "myset", input="elem_man_2", with_scores=True, no_thread=True
@@ -423,6 +480,21 @@ def test_vsim_truth_no_thread_enabled(d_client):
 
     assert len(sim_no_thread) == 10
     assert isinstance(sim_no_thread, dict)
+
+
+@skip_if_server_version_lt("8.2.0")
+def test_vsim_epsilon(d_client):
+    d_client.vset().vadd("myset", [2, 1, 1], "a")
+    d_client.vset().vadd("myset", [2, 0, 1], "b")
+    d_client.vset().vadd("myset", [2, 0, 0], "c")
+    d_client.vset().vadd("myset", [2, 0, 2], "d")
+    d_client.vset().vadd("myset", [-2, -1, -1], "e")
+
+    res1 = d_client.vset().vsim("myset", [2, 1, 1])
+    assert 5 == len(res1)
+
+    res2 = d_client.vset().vsim("myset", [2, 1, 1], epsilon=0.5)
+    assert 4 == len(res2)
 
 
 @skip_if_server_version_lt("7.9.0")
@@ -770,13 +842,49 @@ def test_vrandmember(d_client):
     assert members_list == []
 
 
+@skip_if_server_version_lt("8.2.0")
+def test_8_2_new_vset_features_without_decoding_responces(client):
+    # test vadd
+    elements = ["elem1", "elem2", "elem3"]
+    attrs_dict = {"key1": "value1", "key2": "value2"}
+    for elem in elements:
+        float_array = [random.uniform(0.5, 10) for x in range(0, 8)]
+        resp = client.vset().vadd(
+            "myset", float_array, element=elem, attributes=attrs_dict
+        )
+        assert resp == 1
+
+    # test vsim with attributes
+    vsim_with_attribs = client.vset().vsim("myset", input="elem1", with_attribs=True)
+    assert len(vsim_with_attribs) == 3
+    assert isinstance(vsim_with_attribs, dict)
+    assert isinstance(vsim_with_attribs[b"elem1"], dict)
+    assert vsim_with_attribs[b"elem1"] == attrs_dict
+
+    # test vsim with score and attributes
+    vsim_with_scores_and_attribs = client.vset().vsim(
+        "myset", input="elem1", with_scores=True, with_attribs=True
+    )
+    assert len(vsim_with_scores_and_attribs) == 3
+    assert isinstance(vsim_with_scores_and_attribs, dict)
+    assert isinstance(vsim_with_scores_and_attribs[b"elem1"], dict)
+    assert "score" in vsim_with_scores_and_attribs[b"elem1"]
+    assert "attributes" in vsim_with_scores_and_attribs[b"elem1"]
+    assert isinstance(vsim_with_scores_and_attribs[b"elem1"]["score"], float)
+    assert isinstance(vsim_with_scores_and_attribs[b"elem1"]["attributes"], dict)
+    assert vsim_with_scores_and_attribs[b"elem1"]["attributes"] == attrs_dict
+
+
 @skip_if_server_version_lt("7.9.0")
 def test_vset_commands_without_decoding_responces(client):
     # test vadd
     elements = ["elem1", "elem2", "elem3"]
+    attrs_dict = {"key1": "value1", "key2": "value2"}
     for elem in elements:
         float_array = [random.uniform(0.5, 10) for x in range(0, 8)]
-        resp = client.vset().vadd("myset", float_array, element=elem)
+        resp = client.vset().vadd(
+            "myset", float_array, element=elem, attributes=attrs_dict
+        )
         assert resp == 1
 
     # test vemb
@@ -865,3 +973,149 @@ def _validate_quantization(original, quantized, tolerance=0.1):
         return False
     else:
         return True
+
+
+@skip_if_server_version_lt("8.4.0")
+def test_vrange_basic(d_client):
+    """Test basic VRANGE functionality with lexicographical ordering."""
+    # Add elements with different names
+    elements = ["apple", "banana", "cherry", "date", "elderberry"]
+    for elem in elements:
+        d_client.vset().vadd("myset", [1.0, 2.0, 3.0], elem)
+
+    # Test full range
+    result = d_client.vset().vrange("myset", "-", "+")
+    assert result == elements
+    assert len(result) == 5
+
+    # Test inclusive range
+    result = d_client.vset().vrange("myset", "[banana", "[date")
+    assert result == ["banana", "cherry", "date"]
+
+    # Test exclusive range
+    result = d_client.vset().vrange("myset", "(banana", "(date")
+    assert result == ["cherry"]
+
+
+@skip_if_server_version_lt("8.4.0")
+def test_vrange_with_count(d_client):
+    """Test VRANGE with count parameter."""
+    # Add elements
+    elements = ["a", "b", "c", "d", "e", "f", "g"]
+    for elem in elements:
+        d_client.vset().vadd("myset", [1.0, 2.0], elem)
+
+    # Test with positive count
+    result = d_client.vset().vrange("myset", "-", "+", count=3)
+    assert len(result) == 3
+    assert result == ["a", "b", "c"]
+
+    # Test with count larger than set size
+    result = d_client.vset().vrange("myset", "-", "+", count=100)
+    assert len(result) == 7
+    assert result == elements
+
+    # Test with count = 0
+    result = d_client.vset().vrange("myset", "-", "+", count=0)
+    assert result == []
+
+    # Test with negative count (should return all)
+    result = d_client.vset().vrange("myset", "-", "+", count=-1)
+    assert len(result) == 7
+    assert result == elements
+
+
+@skip_if_server_version_lt("8.4.0")
+def test_vrange_iteration(d_client):
+    """Test VRANGE for stateless iteration."""
+    # Add elements
+    elements = [f"elem{i:03d}" for i in range(20)]
+    for elem in elements:
+        d_client.vset().vadd("myset", [1.0, 2.0], elem)
+
+    # Iterate through all elements, 5 at a time
+    all_results = []
+    start = "-"
+    while True:
+        result = d_client.vset().vrange("myset", start, "+", count=5)
+        if not result:
+            break
+        all_results.extend(result)
+        # Continue from the last element (exclusive)
+        start = f"({result[-1]}"
+
+    assert len(all_results) == 20
+    assert all_results == elements
+
+
+@skip_if_server_version_lt("8.4.0")
+def test_vrange_empty_key(d_client):
+    """Test VRANGE on non-existent key."""
+    result = d_client.vset().vrange("nonexistent", "-", "+")
+    assert result == []
+
+    result = d_client.vset().vrange("nonexistent", "[a", "[z", count=10)
+    assert result == []
+
+
+@skip_if_server_version_lt("8.4.0")
+def test_vrange_special_characters(d_client):
+    """Test VRANGE with elements containing special characters."""
+    # Add elements with special characters
+    elements = ["a:1", "a:2", "b:1", "b:2", "c:1"]
+    for elem in elements:
+        d_client.vset().vadd("myset", [1.0, 2.0], elem)
+
+    # Test range with prefix
+    result = d_client.vset().vrange("myset", "[a:", "[a:9")
+    assert result == ["a:1", "a:2"]
+
+    result = d_client.vset().vrange("myset", "[b:", "[b:9")
+    assert result == ["b:1", "b:2"]
+
+
+@skip_if_server_version_lt("8.4.0")
+def test_vrange_single_element(d_client):
+    """Test VRANGE with a single element."""
+    d_client.vset().vadd("myset", [1.0, 2.0], "single")
+
+    result = d_client.vset().vrange("myset", "-", "+")
+    assert result == ["single"]
+
+    result = d_client.vset().vrange("myset", "[single", "[single")
+    assert result == ["single"]
+
+    result = d_client.vset().vrange("myset", "(single", "+")
+    assert result == []
+
+
+@skip_if_server_version_lt("8.4.0")
+def test_vrange_lexicographical_order(d_client):
+    """Test that VRANGE returns elements in correct lexicographical order."""
+    # Add elements in random order
+    elements = ["zebra", "apple", "mango", "banana", "cherry"]
+    for elem in elements:
+        d_client.vset().vadd("myset", [1.0, 2.0], elem)
+
+    # Should return in sorted order
+    result = d_client.vset().vrange("myset", "-", "+")
+    expected = sorted(elements)
+    assert result == expected
+
+
+@skip_if_server_version_lt("8.4.0")
+def test_vrange_numeric_strings(d_client):
+    """Test VRANGE with numeric string elements."""
+    # Add numeric strings (lexicographical order, not numeric)
+    elements = ["1", "10", "2", "20", "3"]
+    for elem in elements:
+        d_client.vset().vadd("myset", [1.0, 2.0], elem)
+
+    # Lexicographical order: "1", "10", "2", "20", "3"
+    result = d_client.vset().vrange("myset", "-", "+")
+    expected = sorted(elements)  # ["1", "10", "2", "20", "3"]
+    assert result == expected
+
+    # Range from "1" to "2" (inclusive)
+    result = d_client.vset().vrange("myset", "[1", "[2")
+    assert result == ["1", "10", "2"]

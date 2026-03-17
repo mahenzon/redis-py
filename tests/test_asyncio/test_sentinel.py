@@ -3,6 +3,8 @@ from unittest import mock
 
 import pytest
 import pytest_asyncio
+from redis.asyncio.client import StrictRedis
+
 import redis.asyncio.sentinel
 from redis import exceptions
 from redis.asyncio.sentinel import (
@@ -11,9 +13,10 @@ from redis.asyncio.sentinel import (
     SentinelConnectionPool,
     SlaveNotFoundError,
 )
+from tests.conftest import is_resp2_connection
 
 
-@pytest_asyncio.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 def master_ip(master_host):
     yield socket.gethostbyname(master_host[0])
 
@@ -82,6 +85,35 @@ async def cluster(master_ip):
 @pytest_asyncio.fixture()
 def sentinel(request, cluster):
     return Sentinel([("foo", 26379), ("bar", 26379)])
+
+
+@pytest.fixture()
+async def deployed_sentinel(request):
+    sentinel_ips = request.config.getoption("--sentinels")
+    sentinel_endpoints = [
+        (ip.strip(), int(port.strip()))
+        for ip, port in (endpoint.split(":") for endpoint in sentinel_ips.split(","))
+    ]
+    kwargs = {}
+    decode_responses = True
+
+    sentinel_kwargs = {"decode_responses": decode_responses}
+    force_master_ip = "localhost"
+
+    protocol = request.config.getoption("--protocol", 2)
+
+    sentinel = Sentinel(
+        sentinel_endpoints,
+        force_master_ip=force_master_ip,
+        sentinel_kwargs=sentinel_kwargs,
+        socket_timeout=0.1,
+        protocol=protocol,
+        decode_responses=decode_responses,
+        **kwargs,
+    )
+    yield sentinel
+    for s in sentinel.sentinels:
+        await s.close()
 
 
 @pytest.mark.onlynoncluster
@@ -226,19 +258,22 @@ async def test_slave_round_robin(cluster, sentinel, master_ip):
 
 
 @pytest.mark.onlynoncluster
-async def test_ckquorum(cluster, sentinel):
-    assert await sentinel.sentinel_ckquorum("mymaster")
+async def test_ckquorum(sentinel):
+    resp = await sentinel.sentinel_ckquorum("mymaster")
+    assert resp is True
 
 
 @pytest.mark.onlynoncluster
-async def test_flushconfig(cluster, sentinel):
-    assert await sentinel.sentinel_flushconfig()
+async def test_flushconfig(sentinel):
+    resp = await sentinel.sentinel_flushconfig()
+    assert resp is True
 
 
 @pytest.mark.onlynoncluster
 async def test_reset(cluster, sentinel):
     cluster.master["is_odown"] = True
-    assert await sentinel.sentinel_reset("mymaster")
+    resp = await sentinel.sentinel_reset("mymaster")
+    assert resp is True
 
 
 @pytest.mark.onlynoncluster
@@ -284,3 +319,80 @@ async def test_repr_correctly_represents_connection_object(sentinel):
         str(connection)
         == "<redis.asyncio.sentinel.SentinelManagedConnection,host=127.0.0.1,port=6379)>"  # noqa: E501
     )
+
+
+# Tests against real sentinel instances
+@pytest.mark.onlynoncluster
+async def test_get_sentinels(deployed_sentinel):
+    resps = await deployed_sentinel.sentinel_sentinels(
+        "redis-py-test", return_responses=True
+    )
+
+    # validate that the original command response is returned
+    assert isinstance(resps, list)
+
+    # validate that the command has been executed against all sentinels
+    # each response from each sentinel is returned
+    assert len(resps) > 1
+
+    # validate default behavior
+    resps = await deployed_sentinel.sentinel_sentinels("redis-py-test")
+    assert isinstance(resps, bool)
+
+
+@pytest.mark.onlynoncluster
+async def test_get_master_addr_by_name(deployed_sentinel):
+    resps = await deployed_sentinel.sentinel_get_master_addr_by_name(
+        "redis-py-test",
+        return_responses=True,
+    )
+
+    # validate that the original command response is returned
+    assert isinstance(resps, list)
+
+    # validate that the command has been executed just once
+    # when executed once, only one response element is returned
+    assert len(resps) == 1
+
+    assert isinstance(resps[0], tuple)
+
+    # validate default behavior
+    resps = await deployed_sentinel.sentinel_get_master_addr_by_name("redis-py-test")
+    assert isinstance(resps, bool)
+
+
+@pytest.mark.onlynoncluster
+async def test_redis_master_usage(deployed_sentinel):
+    r = await deployed_sentinel.master_for("redis-py-test", db=0)
+    await r.set("foo", "bar")
+    assert (await r.get("foo")) == "bar"
+
+
+@pytest.mark.onlynoncluster
+async def test_sentinel_commands_with_strict_redis_client(request):
+    sentinel_ips = request.config.getoption("--sentinels")
+    sentinel_host, sentinel_port = sentinel_ips.split(",")[0].split(":")
+    protocol = request.config.getoption("--protocol", 2)
+
+    client = StrictRedis(
+        host=sentinel_host, port=sentinel_port, decode_responses=True, protocol=protocol
+    )
+    # skipping commands that change the state of the sentinel setup
+    assert isinstance(
+        await client.sentinel_get_master_addr_by_name("redis-py-test"), tuple
+    )
+    assert isinstance(await client.sentinel_master("redis-py-test"), dict)
+    if is_resp2_connection(client):
+        assert isinstance(await client.sentinel_masters(), dict)
+    else:
+        masters = await client.sentinel_masters()
+        assert isinstance(masters, list)
+        for master in masters:
+            assert isinstance(master, dict)
+
+    assert isinstance(await client.sentinel_sentinels("redis-py-test"), list)
+    assert isinstance(await client.sentinel_slaves("redis-py-test"), list)
+
+    assert isinstance(await client.sentinel_ckquorum("redis-py-test"), bool)
+
+    await client.close()

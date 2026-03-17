@@ -1,7 +1,17 @@
 from unittest.mock import patch
 
 import pytest
-from redis.backoff import AbstractBackoff, ExponentialBackoff, NoBackoff
+from redis.asyncio.retry import Retry as AsyncRetry
+from redis.backoff import (
+    AbstractBackoff,
+    ConstantBackoff,
+    DecorrelatedJitterBackoff,
+    EqualJitterBackoff,
+    ExponentialBackoff,
+    ExponentialWithJitterBackoff,
+    FullJitterBackoff,
+    NoBackoff,
+)
 from redis.client import Redis
 from redis.connection import Connection, UnixDomainSocketConnection
 from redis.exceptions import (
@@ -78,6 +88,51 @@ class TestConnectionConstructorWithRetry:
         assert c.retry_on_error == [ReadOnlyError]
         assert isinstance(c.retry, Retry)
         assert c.retry._retries == retries
+
+
+@pytest.mark.parametrize("retry_class", [Retry, AsyncRetry])
+@pytest.mark.parametrize(
+    "args",
+    [
+        (ConstantBackoff(0), 0),
+        (ConstantBackoff(10), 5),
+        (NoBackoff(), 0),
+    ]
+    + [
+        backoff
+        for Backoff in (
+            DecorrelatedJitterBackoff,
+            EqualJitterBackoff,
+            ExponentialBackoff,
+            ExponentialWithJitterBackoff,
+            FullJitterBackoff,
+        )
+        for backoff in ((Backoff(), 2), (Backoff(25), 5), (Backoff(25, 5), 5))
+    ],
+)
+def test_retry_eq_and_hashable(retry_class, args):
+    assert retry_class(*args) == retry_class(*args)
+
+    # create another retry object with different parameters
+    copy = list(args)
+    if isinstance(copy[0], ConstantBackoff):
+        copy[1] = 9000
+    else:
+        copy[0] = ConstantBackoff(9000)
+
+    assert retry_class(*args) != retry_class(*copy)
+    assert retry_class(*copy) != retry_class(*args)
+    assert (
+        len(
+            {
+                retry_class(*args),
+                retry_class(*args),
+                retry_class(*copy),
+                retry_class(*copy),
+            }
+        )
+        == 2
+    )
 
 
 class TestRetry:

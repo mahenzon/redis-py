@@ -6,8 +6,12 @@ import pytest
 import redis
 from redis.exceptions import ConnectionError, RedisError
 
-from .conftest import skip_if_cryptography, skip_if_nocryptography
-from .ssl_utils import CertificateType, get_tls_certificates
+from .conftest import (
+    skip_if_cryptography,
+    skip_if_nocryptography,
+    skip_if_server_version_lt,
+)
+from .ssl_utils import CertificateType, get_tls_certificates, CN_USERNAME
 
 
 @pytest.mark.ssl
@@ -20,10 +24,10 @@ class TestSSL:
 
     @pytest.fixture(autouse=True)
     def _set_ssl_certs(self, request):
-        tls_cert_subdir = request.session.config.REDIS_INFO["tls_cert_subdir"]
-        self.client_certs = get_tls_certificates(tls_cert_subdir)
+        self.tls_cert_subdir = request.session.config.REDIS_INFO["tls_cert_subdir"]
+        self.client_certs = get_tls_certificates(self.tls_cert_subdir)
         self.server_certs = get_tls_certificates(
-            tls_cert_subdir, cert_type=CertificateType.server
+            self.tls_cert_subdir, cert_type=CertificateType.server
         )
 
     def test_ssl_with_invalid_cert(self, request):
@@ -31,7 +35,7 @@ class TestSSL:
         sslclient = redis.from_url(ssl_url)
         with pytest.raises(ConnectionError) as e:
             sslclient.ping()
-        assert "SSL: CERTIFICATE_VERIFY_FAILED" in str(e)
+        assert "SSL: CERTIFICATE_VERIFY_FAILED" in str(e.value)
         sslclient.close()
 
     def test_ssl_connection(self, request):
@@ -42,7 +46,6 @@ class TestSSL:
             host=p[0],
             port=p[1],
             ssl=True,
-            ssl_check_hostname=False,
             ssl_cert_reqs="none",
         )
         assert r.ping()
@@ -55,7 +58,7 @@ class TestSSL:
 
         with pytest.raises(ConnectionError) as e:
             r.ping()
-        assert "Connection closed by server" in str(e)
+        assert "Connection closed by server" in str(e.value)
         r.close()
 
     def test_validating_self_signed_certificate(self, request):
@@ -105,7 +108,6 @@ class TestSSL:
             host=p[0],
             port=p[1],
             ssl=True,
-            ssl_check_hostname=False,
             ssl_cert_reqs="none",
             ssl_min_version=ssl.TLSVersion.TLSv1_3,
             ssl_ciphers=ssl_ciphers,
@@ -120,14 +122,13 @@ class TestSSL:
             host=p[0],
             port=p[1],
             ssl=True,
-            ssl_check_hostname=False,
             ssl_cert_reqs="none",
             ssl_min_version=ssl.TLSVersion.TLSv1_2,
             ssl_ciphers="foo:bar",
         )
         with pytest.raises(RedisError) as e:
             r.ping()
-        assert "No cipher can be selected" in str(e)
+        assert "No cipher can be selected" in str(e.value)
         r.close()
 
     @pytest.mark.parametrize(
@@ -145,14 +146,13 @@ class TestSSL:
             host=p[0],
             port=p[1],
             ssl=True,
-            ssl_check_hostname=False,
             ssl_cert_reqs="none",
             ssl_min_version=ssl.TLSVersion.TLSv1_2,
             ssl_ciphers=ssl_ciphers,
         )
         with pytest.raises(RedisError) as e:
             r.ping()
-        assert "No cipher can be selected" in str(e)
+        assert "No cipher can be selected" in str(e.value)
         r.close()
 
     def _create_oscp_conn(self, request):
@@ -175,7 +175,7 @@ class TestSSL:
         r = self._create_oscp_conn(request)
         with pytest.raises(RedisError) as e:
             r.ping()
-        assert "cryptography is not installed" in str(e)
+        assert "cryptography is not installed" in str(e.value)
         r.close()
 
     @skip_if_nocryptography()
@@ -183,7 +183,7 @@ class TestSSL:
         r = self._create_oscp_conn(request)
         with pytest.raises(ConnectionError) as e:
             assert r.ping()
-        assert "No AIA information present in ssl certificate" in str(e)
+        assert "No AIA information present in ssl certificate" in str(e.value)
         r.close()
 
     @skip_if_nocryptography()
@@ -209,7 +209,7 @@ class TestSSL:
                 ocsp = OCSPVerifier(wrapped, hostname, 443)
                 with pytest.raises(ConnectionError) as e:
                     assert ocsp.is_valid()
-                assert "REVOKED" in str(e)
+                assert "REVOKED" in str(e.value)
 
     @skip_if_nocryptography()
     def test_unauthorized_ocsp(self):
@@ -234,7 +234,7 @@ class TestSSL:
                 ocsp = OCSPVerifier(wrapped, hostname, 443)
                 with pytest.raises(ConnectionError) as e:
                     assert ocsp.is_valid()
-                assert "from the" in str(e)
+                assert "from the" in str(e.value)
 
     @skip_if_nocryptography()
     def test_unauthorized_then_direct(self):
@@ -291,7 +291,7 @@ class TestSSL:
 
         with pytest.raises(ConnectionError) as e:
             r.ping()
-        assert "no ocsp response present" in str(e)
+        assert "no ocsp response present" in str(e.value)
         r.close()
 
         r = redis.Redis(
@@ -307,5 +307,162 @@ class TestSSL:
 
         with pytest.raises(ConnectionError) as e:
             r.ping()
-        assert "no ocsp response present" in str(e)
+        assert "no ocsp response present" in str(e.value)
         r.close()
+
+    def test_cert_reqs_none_with_check_hostname(self, request):
+        """Test that when ssl_cert_reqs=none is used with ssl_check_hostname=True,
+        the connection is created successfully with check_hostname internally set to False"""
+        ssl_url = request.config.option.redis_ssl_url
+        parsed_url = urlparse(ssl_url)
+        r = redis.Redis(
+            host=parsed_url.hostname,
+            port=parsed_url.port,
+            ssl=True,
+            ssl_cert_reqs="none",
+            # Check that ssl_check_hostname is ignored, when ssl_cert_reqs=none
+            ssl_check_hostname=True,
+        )
+        try:
+            # Connection should be successful
+            assert r.ping()
+            # check_hostname should have been automatically set to False
+            assert r.connection_pool.connection_class == redis.SSLConnection
+            conn = r.connection_pool.make_connection()
+            assert conn.check_hostname is False
+        finally:
+            r.close()
+
+    def test_ssl_verify_flags_applied_to_context(self, request):
+        """
+        Test that ssl_include_verify_flags and ssl_exclude_verify_flags
+        are properly applied to the SSL context
+        """
+        ssl_url = request.config.option.redis_ssl_url
+        parsed_url = urlparse(ssl_url)
+
+        # Test with specific SSL verify flags
+        ssl_include_verify_flags = [
+            ssl.VerifyFlags.VERIFY_CRL_CHECK_LEAF,  # Disable strict verification
+            ssl.VerifyFlags.VERIFY_CRL_CHECK_CHAIN,  # Enable partial chain
+        ]
+
+        ssl_exclude_verify_flags = [
+            ssl.VerifyFlags.VERIFY_X509_STRICT,  # Disable trusted first
+        ]
+
+        r = redis.Redis(
+            host=parsed_url.hostname,
+            port=parsed_url.port,
+            ssl=True,
+            ssl_cert_reqs="none",
+            ssl_include_verify_flags=ssl_include_verify_flags,
+            ssl_exclude_verify_flags=ssl_exclude_verify_flags,
+        )
+
+        try:
+            # Get the connection to trigger SSL context creation
+            conn = r.connection_pool.get_connection()
+            assert isinstance(conn, redis.SSLConnection)
+
+            # Verify the flags were processed by checking they're stored in connection
+            assert conn.ssl_include_verify_flags is not None
+            assert len(conn.ssl_include_verify_flags) == 2
+
+            assert conn.ssl_exclude_verify_flags is not None
+            assert len(conn.ssl_exclude_verify_flags) == 1
+
+            # Check each flag individually
+            for flag in ssl_include_verify_flags:
+                assert flag in conn.ssl_include_verify_flags, (
+                    f"Flag {flag} not found in stored ssl_include_verify_flags"
+                )
+            for flag in ssl_exclude_verify_flags:
+                assert flag in conn.ssl_exclude_verify_flags, (
+                    f"Flag {flag} not found in stored ssl_exclude_verify_flags"
+                )
+
+            # Test the actual SSL context created by the connection
+            # We need to create a mock socket and call _wrap_socket_with_ssl to get the context
+            import socket
+            import unittest.mock
+
+            mock_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+            try:
+                # Mock the wrap_socket method to capture the context
+                captured_context = None
+
+                def capture_context_wrap_socket(context_self, sock, **_kwargs):
+                    nonlocal captured_context
+                    captured_context = context_self
+                    # Don't actually wrap the socket, just return the original socket
+                    # to avoid connection errors
+                    return sock
+
+                with unittest.mock.patch.object(
+                    ssl.SSLContext, "wrap_socket", capture_context_wrap_socket
+                ):
+                    try:
+                        conn._wrap_socket_with_ssl(mock_sock)
+                    except Exception:
+                        # We expect this to potentially fail since we're not actually connecting
+                        # but we should have captured the context
+                        pass
+
+                # Validate that we captured a context and it has the correct flags applied
+                assert captured_context is not None, "SSL context was not captured"
+
+                # Verify that VERIFY_X509_STRICT was disabled (bit cleared)
+                assert not (
+                    captured_context.verify_flags & ssl.VerifyFlags.VERIFY_X509_STRICT
+                ), "VERIFY_X509_STRICT should be disabled but is enabled"
+
+                # Verify that VERIFY_CRL_CHECK_CHAIN was enabled (bit set)
+                assert (
+                    captured_context.verify_flags
+                    & ssl.VerifyFlags.VERIFY_CRL_CHECK_CHAIN
+                ), "VERIFY_CRL_CHECK_CHAIN should be enabled but is disabled"
+
+            finally:
+                mock_sock.close()
+
+        finally:
+            r.close()
+
+    @skip_if_server_version_lt("8.5.0")
+    def test_ssl_authenticate_with_client_cert(self, request, r):
+        """Test that when client certificate is used for authentication,
+        the connection is created successfully"""
+
+        try:
+            # Non SSL client, to setup ACL
+            assert r.acl_setuser(
+                CN_USERNAME,
+                enabled=True,
+                reset=True,
+                passwords=["+clientpass"],
+                keys=["*"],
+                commands=["+acl"],
+            )
+        finally:
+            r.close()
+
+        ssl_url = request.config.option.redis_ssl_url
+        p = urlparse(ssl_url)[1].split(":")
+        client_cn_cert, client_cn_key, ca_cert = get_tls_certificates(
+            self.tls_cert_subdir, CertificateType.client_cn
+        )
+        r = redis.Redis(
+            host=p[0],
+            port=p[1],
+            ssl=True,
+            ssl_certfile=client_cn_cert,
+            ssl_keyfile=client_cn_key,
+            ssl_cert_reqs="required",
+            ssl_ca_certs=ca_cert,
+        )
+        try:
+            assert r.acl_whoami() == CN_USERNAME
+        finally:
+            r.close()

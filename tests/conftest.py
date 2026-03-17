@@ -25,6 +25,7 @@ from redis.cache import (
 )
 from redis.connection import Connection, ConnectionInterface, SSLConnection, parse_url
 from redis.credentials import CredentialProvider
+from redis.event import EventDispatcherInterface
 from redis.exceptions import RedisClusterException
 from redis.retry import Retry
 from tests.ssl_utils import get_tls_certificates
@@ -160,6 +161,13 @@ def pytest_addoption(parser):
         action="store",
         default=None,
         help="Name of the Redis endpoint the tests should be executed on",
+    )
+
+    parser.addoption(
+        "--cluster-endpoint-name",
+        action="store",
+        default=None,
+        help="Name of the Redis endpoint with OSS API the tests should be executed on",
     )
 
 
@@ -333,6 +341,15 @@ def skip_if_resp_version(resp_version) -> _TestDecorator:
     return pytest.mark.skipif(check, reason=f"RESP version required != {resp_version}")
 
 
+def skip_if_hiredis_parser() -> _TestDecorator:
+    try:
+        import hiredis  # noqa
+
+        return pytest.mark.skipif(True, reason="hiredis dependency found")
+    except ImportError:
+        return pytest.mark.skipif(False, reason="No hiredis dependency")
+
+
 def _get_client(
     cls, request, single_connection_client=True, flushdb=True, from_url=None, **kwargs
 ):
@@ -487,6 +504,9 @@ def _gen_cluster_mock_resp(r, response):
     connection = Mock(spec=Connection)
     connection.retry = Retry(NoBackoff(), 0)
     connection.read_response.return_value = response
+    connection.host = "localhost"
+    connection.port = 6379
+    connection.db = 0
     with mock.patch.object(r, "connection", connection):
         yield r
 
@@ -579,7 +599,16 @@ def mock_cache() -> CacheInterface:
 @pytest.fixture()
 def mock_connection() -> ConnectionInterface:
     mock_connection = Mock(spec=ConnectionInterface)
+    # Add host and port attributes needed by find_connection_owner
+    mock_connection.host = "127.0.0.1"
+    mock_connection.port = 6379
     return mock_connection
+
+
+@pytest.fixture()
+def mock_ed() -> EventDispatcherInterface:
+    mock_ed = Mock(spec=EventDispatcherInterface)
+    return mock_ed
 
 
 @pytest.fixture()

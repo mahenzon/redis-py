@@ -4,12 +4,18 @@ import time
 from contextlib import closing
 from threading import Thread
 from unittest import mock
+from unittest.mock import MagicMock
 
 import pytest
 import redis
 from redis.cache import CacheConfig
 from redis.connection import CacheProxyConnection, Connection, to_bool
-from redis.utils import HIREDIS_AVAILABLE, SSL_AVAILABLE
+from redis.event import (
+    AfterConnectionReleasedEvent,
+    EventDispatcher,
+    EventListenerInterface,
+)
+from redis.utils import SSL_AVAILABLE
 
 from .conftest import (
     _get_client,
@@ -19,6 +25,9 @@ from .conftest import (
 )
 from .test_pubsub import wait_for_message
 
+if SSL_AVAILABLE:
+    import ssl
+
 
 class DummyConnection:
     description_format = "DummyConnection<>"
@@ -26,12 +35,22 @@ class DummyConnection:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.pid = os.getpid()
+        self._sock = None
 
     def connect(self):
-        pass
+        self._sock = mock.Mock()
+
+    def disconnect(self):
+        self._sock = None
 
     def can_read(self):
         return False
+
+    def should_reconnect(self):
+        return False
+
+    def re_auth(self):
+        pass
 
 
 class TestConnectionPool:
@@ -50,10 +69,14 @@ class TestConnectionPool:
         return pool
 
     def test_connection_creation(self):
-        connection_kwargs = {"foo": "bar", "biz": "baz"}
+        connection_kwargs = {
+            "foo": "bar",
+            "biz": "baz",
+        }
         pool = self.get_pool(
             connection_kwargs=connection_kwargs, connection_class=DummyConnection
         )
+
         connection = pool.get_connection()
         assert isinstance(connection, DummyConnection)
         assert connection.kwargs == connection_kwargs
@@ -76,11 +99,13 @@ class TestConnectionPool:
         assert c1 != c2
 
     def test_max_connections(self, master_host):
-        connection_kwargs = {"host": master_host[0], "port": master_host[1]}
-        pool = self.get_pool(max_connections=2, connection_kwargs=connection_kwargs)
+        # Use DummyConnection to avoid actual connection to Redis
+        # This prevents authentication issues and makes the test more reliable
+        # while still properly testing the MaxConnectionsError behavior
+        pool = self.get_pool(max_connections=2, connection_class=DummyConnection)
         pool.get_connection()
         pool.get_connection()
-        with pytest.raises(redis.ConnectionError):
+        with pytest.raises(redis.MaxConnectionsError):
             pool.get_connection()
 
     def test_reuse_previously_released_connection(self, master_host):
@@ -128,6 +153,21 @@ class TestConnectionPool:
         expected = "path=/abc,db=1,client_name=test-client"
         assert expected in repr(pool)
 
+    def test_pool_disconnect(self, master_host):
+        connection_kwargs = {
+            "host": master_host[0],
+            "port": master_host[1],
+        }
+        pool = self.get_pool(connection_kwargs=connection_kwargs)
+
+        conn = pool.get_connection()
+        pool.disconnect()
+        assert not conn._sock
+
+        conn.connect()
+        pool.disconnect(inuse_connections=False)
+        assert conn._sock
+
 
 class TestBlockingConnectionPool:
     def get_pool(self, connection_kwargs=None, max_connections=10, timeout=20):
@@ -147,6 +187,7 @@ class TestBlockingConnectionPool:
             "host": master_host[0],
             "port": master_host[1],
         }
+
         pool = self.get_pool(connection_kwargs=connection_kwargs)
         connection = pool.get_connection()
         assert isinstance(connection, DummyConnection)
@@ -205,19 +246,44 @@ class TestBlockingConnectionPool:
         pool = redis.ConnectionPool(
             host="localhost", port=6379, client_name="test-client"
         )
-        expected = "host=localhost,port=6379,db=0,client_name=test-client"
+        expected = "host=localhost,port=6379,client_name=test-client"
         assert expected in repr(pool)
 
     def test_repr_contains_db_info_unix(self):
         pool = redis.ConnectionPool(
             connection_class=redis.UnixDomainSocketConnection,
             path="abc",
+            db=0,
             client_name="test-client",
         )
         expected = "path=abc,db=0,client_name=test-client"
         assert expected in repr(pool)
 
-    @pytest.mark.skipif(HIREDIS_AVAILABLE, reason="PythonParser only")
+    def test_repr_redacts_sensitive_information(self):
+        """Test that __repr__ redacts sensitive values like password and username."""
+        pool = redis.ConnectionPool(
+            host="localhost",
+            port=6379,
+            password="secret_password_123",
+            username="myuser",
+            ssl_password="ssl_secret_456",
+            db=0,
+        )
+        repr_output = repr(pool)
+
+        # Verify sensitive values are redacted
+        assert "secret_password_123" not in repr_output
+        assert "myuser" not in repr_output
+        assert "ssl_secret_456" not in repr_output
+
+        # Verify the REDACTED placeholder is present
+        assert "<REDACTED>" in repr_output
+
+        # Verify non-sensitive values are still visible
+        assert "host=localhost" in repr_output
+        assert "port=6379" in repr_output
+        assert "db=0" in repr_output
+
     @pytest.mark.onlynoncluster
     @skip_if_resp_version(2)
     @skip_if_server_version_lt("7.4.0")
@@ -230,6 +296,23 @@ class TestBlockingConnectionPool:
             cache_config=CacheConfig(),
         )
         assert isinstance(pool.get_connection(), CacheProxyConnection)
+
+    def test_pool_disconnect(self, master_host):
+        connection_kwargs = {
+            "foo": "bar",
+            "biz": "baz",
+            "host": master_host[0],
+            "port": master_host[1],
+        }
+        pool = self.get_pool(connection_kwargs=connection_kwargs)
+
+        conn = pool.get_connection()
+        pool.disconnect()
+        assert not conn._sock
+
+        conn.connect()
+        pool.disconnect(inuse_connections=False)
+        assert conn._sock
 
 
 class TestConnectionPoolURLParsing:
@@ -501,8 +584,6 @@ class TestSSLConnectionURLParsing:
         assert pool.connection_class == MyConnection
 
     def test_cert_reqs_options(self):
-        import ssl
-
         class DummyConnectionPool(redis.ConnectionPool):
             def get_connection(self):
                 return self.make_connection()
@@ -521,6 +602,65 @@ class TestSSLConnectionURLParsing:
 
         pool = DummyConnectionPool.from_url("rediss://?ssl_check_hostname=True")
         assert pool.get_connection().check_hostname is True
+
+    def test_ssl_flags_config_parsing(self):
+        class DummyConnectionPool(redis.ConnectionPool):
+            def get_connection(self):
+                return self.make_connection()
+
+        pool = DummyConnectionPool.from_url(
+            "rediss://?ssl_include_verify_flags=VERIFY_X509_STRICT,VERIFY_CRL_CHECK_CHAIN"
+        )
+
+        assert pool.get_connection().ssl_include_verify_flags == [
+            ssl.VerifyFlags.VERIFY_X509_STRICT,
+            ssl.VerifyFlags.VERIFY_CRL_CHECK_CHAIN,
+        ]
+
+        pool = DummyConnectionPool.from_url(
+            "rediss://?ssl_include_verify_flags=[VERIFY_X509_STRICT, VERIFY_CRL_CHECK_CHAIN]"
+        )
+
+        assert pool.get_connection().ssl_include_verify_flags == [
+            ssl.VerifyFlags.VERIFY_X509_STRICT,
+            ssl.VerifyFlags.VERIFY_CRL_CHECK_CHAIN,
+        ]
+
+        pool = DummyConnectionPool.from_url(
+            "rediss://?ssl_exclude_verify_flags=VERIFY_X509_STRICT, VERIFY_CRL_CHECK_CHAIN"
+        )
+
+        assert pool.get_connection().ssl_exclude_verify_flags == [
+            ssl.VerifyFlags.VERIFY_X509_STRICT,
+            ssl.VerifyFlags.VERIFY_CRL_CHECK_CHAIN,
+        ]
+
+        pool = DummyConnectionPool.from_url(
+            "rediss://?ssl_include_verify_flags=VERIFY_X509_STRICT, VERIFY_CRL_CHECK_CHAIN&ssl_exclude_verify_flags=VERIFY_CRL_CHECK_LEAF"
+        )
+
+        assert pool.get_connection().ssl_include_verify_flags == [
+            ssl.VerifyFlags.VERIFY_X509_STRICT,
+            ssl.VerifyFlags.VERIFY_CRL_CHECK_CHAIN,
+        ]
+        assert pool.get_connection().ssl_exclude_verify_flags == [
+            ssl.VerifyFlags.VERIFY_CRL_CHECK_LEAF,
+        ]
+
+    def test_ssl_flags_config_invalid_flag(self):
+        class DummyConnectionPool(redis.ConnectionPool):
+            def get_connection(self):
+                return self.make_connection()
+
+        with pytest.raises(ValueError):
+            DummyConnectionPool.from_url(
+                "rediss://?ssl_include_verify_flags=[VERIFY_X509,VERIFY_CRL_CHECK_CHAIN]"
+            )
+
+        with pytest.raises(ValueError):
+            DummyConnectionPool.from_url(
+                "rediss://?ssl_exclude_verify_flags=[VERIFY_X509_STRICT1, VERIFY_CRL_CHECK_CHAIN]"
+            )
 
 
 class TestConnection:
@@ -599,7 +739,7 @@ class TestConnection:
             r.execute_command("DEBUG", "ERROR", "OOM blah blah")
 
     def test_connect_from_url_tcp(self):
-        connection = redis.Redis.from_url("redis://localhost")
+        connection = redis.Redis.from_url("redis://localhost:6379?db=0")
         pool = connection.connection_pool
 
         assert re.match(
@@ -607,7 +747,7 @@ class TestConnection:
         ).groups() == (
             "ConnectionPool",
             "Connection",
-            "host=localhost,port=6379,db=0",
+            "db=0,host=localhost,port=6379",
         )
 
     def test_connect_from_url_unix(self):
@@ -619,7 +759,7 @@ class TestConnection:
         ).groups() == (
             "ConnectionPool",
             "UnixDomainSocketConnection",
-            "path=/path/to/socket,db=0",
+            "path=/path/to/socket",
         )
 
     @skip_if_redis_enterprise()
@@ -849,3 +989,52 @@ class TestHealthCheck:
             assert wait_for_message(p) is None
             m.assert_called_with("PING", p.HEALTH_CHECK_MESSAGE, check_health=False)
             self.assert_interval_advanced(p.connection)
+
+
+class TestConnectionPoolReleasedEventEmission:
+    """Tests for AfterConnectionReleasedEvent emission from ConnectionPool."""
+
+    def test_connection_released_event_emitted_on_release(self):
+        """Test that AfterConnectionReleasedEvent is emitted when releasing a connection."""
+        event_dispatcher = EventDispatcher()
+        listener = MagicMock(spec=EventListenerInterface)
+        event_dispatcher.register_listeners(
+            {
+                AfterConnectionReleasedEvent: [listener],
+            }
+        )
+
+        pool = redis.ConnectionPool(
+            connection_class=DummyConnection,
+            event_dispatcher=event_dispatcher,
+        )
+
+        conn = pool.get_connection()
+        pool.release(conn)
+
+        listener.listen.assert_called_once()
+        event = listener.listen.call_args[0][0]
+        assert isinstance(event, AfterConnectionReleasedEvent)
+
+    def test_connection_released_event_not_emitted_for_foreign_connection(self):
+        """Test that AfterConnectionReleasedEvent is NOT emitted for connections not owned by pool."""
+        event_dispatcher = EventDispatcher()
+        listener = MagicMock(spec=EventListenerInterface)
+        event_dispatcher.register_listeners(
+            {
+                AfterConnectionReleasedEvent: [listener],
+            }
+        )
+
+        pool = redis.ConnectionPool(
+            connection_class=DummyConnection,
+            event_dispatcher=event_dispatcher,
+        )
+
+        # Create a connection that doesn't belong to this pool
+        foreign_conn = DummyConnection()
+
+        pool.release(foreign_conn)
+
+        # Event should NOT be emitted for foreign connection
+        listener.listen.assert_not_called()

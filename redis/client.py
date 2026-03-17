@@ -1,4 +1,5 @@
 import copy
+import logging
 import re
 import threading
 import time
@@ -9,11 +10,13 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Mapping,
     Optional,
     Set,
     Type,
     Union,
+    overload,
 )
 
 from redis._parsers.encoders import Encoder
@@ -23,6 +26,7 @@ from redis._parsers.helpers import (
     _RedisCallbacksRESP3,
     bool_ok,
 )
+from redis._parsers.socket import SENTINEL
 from redis.backoff import ExponentialWithJitterBackoff
 from redis.cache import CacheConfig, CacheInterface
 from redis.commands import (
@@ -34,11 +38,13 @@ from redis.commands import (
 from redis.commands.core import Script
 from redis.connection import (
     AbstractConnection,
+    Connection,
     ConnectionPool,
     SSLConnection,
     UnixDomainSocketConnection,
 )
 from redis.credentials import CredentialProvider
+from redis.driver_info import DriverInfo, resolve_driver_info
 from redis.event import (
     AfterPooledConnectionsInstantiationEvent,
     AfterPubSubConnectionInstantiationEvent,
@@ -55,12 +61,30 @@ from redis.exceptions import (
     WatchError,
 )
 from redis.lock import Lock
+from redis.maint_notifications import (
+    MaintNotificationsConfig,
+    OSSMaintNotificationsHandler,
+)
+from redis.observability.attributes import PubSubDirection
+from redis.observability.recorder import (
+    record_error_count,
+    record_operation_duration,
+    record_pubsub_message,
+)
 from redis.retry import Retry
+from redis.typing import (
+    ResponseTypeAnyString,
+    ResponseTypeListOfAnyOptionalStrings,
+    ResponseTypeListOfAnyStrings,
+    ResponseTypeLPopRPop,
+    ResponseTypeOptionalAnyString,
+    ResponseTypeOptionalListOfAnyStrings,
+    ResponseTypeOptionalLMPop,
+)
 from redis.utils import (
-    HIREDIS_AVAILABLE,
     _set_info_logger,
+    check_protocol_version,
     deprecated_args,
-    get_lib_version,
     safe_str,
     str_if_bytes,
     truncate_text,
@@ -71,11 +95,31 @@ if TYPE_CHECKING:
 
     import OpenSSL
 
+    from redis.typing import (
+        RedisDecoded,
+        RedisEncoded,
+        RedisEncodedOrDecoded,
+    )
+
 SYM_EMPTY = b""
 EMPTY_RESPONSE = "EMPTY_RESPONSE"
 
 # some responses (ie. dump) are binary, and just meant to never be decoded
 NEVER_DECODE = "NEVER_DECODE"
+
+
+logger = logging.getLogger(__name__)
+
+
+def is_debug_log_enabled():
+    return logger.isEnabledFor(logging.DEBUG)
+
+
+def add_debug_log_for_operation_failure(connection: "AbstractConnection"):
+    logger.debug(
+        f"Operation failed, "
+        f"with connection: {connection}, details: {connection.extract_connection_details() if connection else 'no connection'}",
+    )
 
 
 class CaseInsensitiveDict(dict):
@@ -109,7 +153,19 @@ class AbstractRedis:
     pass
 
 
-class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
+class Redis(
+    RedisModuleCommands,
+    CoreCommands[
+        ResponseTypeAnyString,
+        ResponseTypeOptionalAnyString,
+        ResponseTypeListOfAnyStrings,
+        ResponseTypeListOfAnyOptionalStrings,
+        ResponseTypeOptionalListOfAnyStrings,
+        ResponseTypeOptionalLMPop,
+        ResponseTypeLPopRPop,
+    ],
+    SentinelCommands,
+):
     """
     Implementation of the Redis protocol.
 
@@ -124,8 +180,56 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
     It is not safe to pass PubSub or Pipeline objects between threads.
     """
 
+    # Overload for decode_responses=True
+    @overload
     @classmethod
-    def from_url(cls, url: str, **kwargs) -> "Redis":
+    def from_url(
+        cls,
+        url: str,
+        *,
+        decode_responses: Literal[True],
+        **kwargs: Any,
+    ) -> "RedisDecoded": ...
+
+    # Overload for decode_responses=False
+    @overload
+    @classmethod
+    def from_url(
+        cls,
+        url: str,
+        *,
+        decode_responses: Literal[False],
+        **kwargs: Any,
+    ) -> "RedisEncoded": ...
+
+    # Runtime bool decode_responses=some_bool_var
+    @overload
+    @classmethod
+    def from_url(
+        cls,
+        url: str,
+        *,
+        decode_responses: bool,
+        **kwargs: Any,
+    ) -> "RedisEncodedOrDecoded": ...
+
+    # Overload for no decode_responses passed - by default False
+    @overload
+    @classmethod
+    def from_url(
+        cls,
+        url: str,
+        **kwargs: Any,
+    ) -> "RedisEncoded": ...
+
+    @classmethod
+    def from_url(
+        cls: Type["RedisEncoded"]
+        | Type["RedisDecoded"]
+        | Type["RedisEncodedOrDecoded"],
+        url: str,
+        **kwargs: Any,
+    ) -> "RedisEncoded | RedisDecoded | RedisEncodedOrDecoded":
         """
         Return a Redis client object configured from the given URL
 
@@ -177,9 +281,9 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
 
     @classmethod
     def from_pool(
-        cls: Type["Redis"],
+        cls,
         connection_pool: ConnectionPool,
-    ) -> "Redis":
+    ) -> "RedisEncoded | RedisDecoded | RedisEncodedOrDecoded":
         """
         Return a Redis client from the given connection pool.
         The Redis client will take ownership of the connection pool and
@@ -191,10 +295,183 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         client.auto_close_connection_pool = True
         return client
 
+    # Default case - decode_responses=False
+    @overload
+    def __init__(
+        self: "RedisEncoded",
+        host: str = "localhost",
+        port: int = 6379,
+        db: int = 0,
+        password: Optional[str] = None,
+        socket_timeout: Optional[float] = None,
+        socket_connect_timeout: Optional[float] = None,
+        socket_keepalive: Optional[bool] = None,
+        socket_keepalive_options: Optional[Mapping[int, Union[int, bytes]]] = None,
+        connection_pool: Optional[ConnectionPool] = None,
+        unix_socket_path: Optional[str] = None,
+        encoding: str = "utf-8",
+        encoding_errors: str = "strict",
+        decode_responses: Literal[False] = False,
+        retry_on_timeout: bool = False,
+        retry: Retry = Retry(
+            backoff=ExponentialWithJitterBackoff(base=1, cap=10), retries=3
+        ),
+        retry_on_error: Optional[List[Type[Exception]]] = None,
+        ssl: bool = False,
+        ssl_keyfile: Optional[str] = None,
+        ssl_certfile: Optional[str] = None,
+        ssl_cert_reqs: Union[str, "ssl.VerifyMode"] = "required",
+        ssl_include_verify_flags: Optional[List["ssl.VerifyFlags"]] = None,
+        ssl_exclude_verify_flags: Optional[List["ssl.VerifyFlags"]] = None,
+        ssl_ca_certs: Optional[str] = None,
+        ssl_ca_path: Optional[str] = None,
+        ssl_ca_data: Optional[str] = None,
+        ssl_check_hostname: bool = True,
+        ssl_password: Optional[str] = None,
+        ssl_validate_ocsp: bool = False,
+        ssl_validate_ocsp_stapled: bool = False,
+        ssl_ocsp_context: Optional["OpenSSL.SSL.Context"] = None,
+        ssl_ocsp_expected_cert: Optional[str] = None,
+        ssl_min_version: Optional["ssl.TLSVersion"] = None,
+        ssl_ciphers: Optional[str] = None,
+        max_connections: Optional[int] = None,
+        single_connection_client: bool = False,
+        health_check_interval: int = 0,
+        client_name: Optional[str] = None,
+        lib_name: Optional[str] = None,
+        lib_version: Optional[str] = None,
+        driver_info: Optional["DriverInfo"] = None,
+        username: Optional[str] = None,
+        redis_connect_func: Optional[Callable[[], None]] = None,
+        credential_provider: Optional[CredentialProvider] = None,
+        protocol: Optional[int] = 2,
+        cache: Optional[CacheInterface] = None,
+        cache_config: Optional[CacheConfig] = None,
+        event_dispatcher: Optional[EventDispatcher] = None,
+        maint_notifications_config: Optional[MaintNotificationsConfig] = None,
+    ) -> None: ...
+
+    # Overload for decode_responses=True
+    @overload
+    def __init__(
+        self: "RedisDecoded",
+        host: str = "localhost",
+        port: int = 6379,
+        db: int = 0,
+        password: Optional[str] = None,
+        socket_timeout: Optional[float] = None,
+        socket_connect_timeout: Optional[float] = None,
+        socket_keepalive: Optional[bool] = None,
+        socket_keepalive_options: Optional[Mapping[int, Union[int, bytes]]] = None,
+        connection_pool: Optional[ConnectionPool] = None,
+        unix_socket_path: Optional[str] = None,
+        encoding: str = "utf-8",
+        encoding_errors: str = "strict",
+        decode_responses: Literal[True] = ...,
+        retry_on_timeout: bool = False,
+        retry: Retry = Retry(
+            backoff=ExponentialWithJitterBackoff(base=1, cap=10), retries=3
+        ),
+        retry_on_error: Optional[List[Type[Exception]]] = None,
+        ssl: bool = False,
+        ssl_keyfile: Optional[str] = None,
+        ssl_certfile: Optional[str] = None,
+        ssl_cert_reqs: Union[str, "ssl.VerifyMode"] = "required",
+        ssl_include_verify_flags: Optional[List["ssl.VerifyFlags"]] = None,
+        ssl_exclude_verify_flags: Optional[List["ssl.VerifyFlags"]] = None,
+        ssl_ca_certs: Optional[str] = None,
+        ssl_ca_path: Optional[str] = None,
+        ssl_ca_data: Optional[str] = None,
+        ssl_check_hostname: bool = True,
+        ssl_password: Optional[str] = None,
+        ssl_validate_ocsp: bool = False,
+        ssl_validate_ocsp_stapled: bool = False,
+        ssl_ocsp_context: Optional["OpenSSL.SSL.Context"] = None,
+        ssl_ocsp_expected_cert: Optional[str] = None,
+        ssl_min_version: Optional["ssl.TLSVersion"] = None,
+        ssl_ciphers: Optional[str] = None,
+        max_connections: Optional[int] = None,
+        single_connection_client: bool = False,
+        health_check_interval: int = 0,
+        client_name: Optional[str] = None,
+        lib_name: Optional[str] = None,
+        lib_version: Optional[str] = None,
+        driver_info: Optional["DriverInfo"] = None,
+        username: Optional[str] = None,
+        redis_connect_func: Optional[Callable[[], None]] = None,
+        credential_provider: Optional[CredentialProvider] = None,
+        protocol: Optional[int] = 2,
+        cache: Optional[CacheInterface] = None,
+        cache_config: Optional[CacheConfig] = None,
+        event_dispatcher: Optional[EventDispatcher] = None,
+        maint_notifications_config: Optional[MaintNotificationsConfig] = None,
+    ) -> None: ...
+
+    # Runtime bool decode_responses=some_bool_var
+    @overload
+    def __init__(
+        self: "RedisEncodedOrDecoded",
+        host: str = "localhost",
+        port: int = 6379,
+        db: int = 0,
+        password: Optional[str] = None,
+        socket_timeout: Optional[float] = None,
+        socket_connect_timeout: Optional[float] = None,
+        socket_keepalive: Optional[bool] = None,
+        socket_keepalive_options: Optional[Mapping[int, Union[int, bytes]]] = None,
+        connection_pool: Optional[ConnectionPool] = None,
+        unix_socket_path: Optional[str] = None,
+        encoding: str = "utf-8",
+        encoding_errors: str = "strict",
+        decode_responses: bool = False,
+        retry_on_timeout: bool = False,
+        retry: Retry = Retry(
+            backoff=ExponentialWithJitterBackoff(base=1, cap=10), retries=3
+        ),
+        retry_on_error: Optional[List[Type[Exception]]] = None,
+        ssl: bool = False,
+        ssl_keyfile: Optional[str] = None,
+        ssl_certfile: Optional[str] = None,
+        ssl_cert_reqs: Union[str, "ssl.VerifyMode"] = "required",
+        ssl_include_verify_flags: Optional[List["ssl.VerifyFlags"]] = None,
+        ssl_exclude_verify_flags: Optional[List["ssl.VerifyFlags"]] = None,
+        ssl_ca_certs: Optional[str] = None,
+        ssl_ca_path: Optional[str] = None,
+        ssl_ca_data: Optional[str] = None,
+        ssl_check_hostname: bool = True,
+        ssl_password: Optional[str] = None,
+        ssl_validate_ocsp: bool = False,
+        ssl_validate_ocsp_stapled: bool = False,
+        ssl_ocsp_context: Optional["OpenSSL.SSL.Context"] = None,
+        ssl_ocsp_expected_cert: Optional[str] = None,
+        ssl_min_version: Optional["ssl.TLSVersion"] = None,
+        ssl_ciphers: Optional[str] = None,
+        max_connections: Optional[int] = None,
+        single_connection_client: bool = False,
+        health_check_interval: int = 0,
+        client_name: Optional[str] = None,
+        lib_name: Optional[str] = None,
+        lib_version: Optional[str] = None,
+        driver_info: Optional["DriverInfo"] = None,
+        username: Optional[str] = None,
+        redis_connect_func: Optional[Callable[[], None]] = None,
+        credential_provider: Optional[CredentialProvider] = None,
+        protocol: Optional[int] = 2,
+        cache: Optional[CacheInterface] = None,
+        cache_config: Optional[CacheConfig] = None,
+        event_dispatcher: Optional[EventDispatcher] = None,
+        maint_notifications_config: Optional[MaintNotificationsConfig] = None,
+    ) -> None: ...
+
     @deprecated_args(
         args_to_warn=["retry_on_timeout"],
         reason="TimeoutError is included by default.",
         version="6.0.0",
+    )
+    @deprecated_args(
+        args_to_warn=["lib_name", "lib_version"],
+        reason="Use 'driver_info' parameter instead. "
+        "lib_name and lib_version will be removed in a future version.",
     )
     def __init__(
         self,
@@ -220,6 +497,8 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         ssl_keyfile: Optional[str] = None,
         ssl_certfile: Optional[str] = None,
         ssl_cert_reqs: Union[str, "ssl.VerifyMode"] = "required",
+        ssl_include_verify_flags: Optional[List["ssl.VerifyFlags"]] = None,
+        ssl_exclude_verify_flags: Optional[List["ssl.VerifyFlags"]] = None,
         ssl_ca_certs: Optional[str] = None,
         ssl_ca_path: Optional[str] = None,
         ssl_ca_data: Optional[str] = None,
@@ -235,8 +514,9 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         single_connection_client: bool = False,
         health_check_interval: int = 0,
         client_name: Optional[str] = None,
-        lib_name: Optional[str] = "redis-py",
-        lib_version: Optional[str] = get_lib_version(),
+        lib_name: Optional[str] = None,
+        lib_version: Optional[str] = None,
+        driver_info: Optional["DriverInfo"] = None,
         username: Optional[str] = None,
         redis_connect_func: Optional[Callable[[], None]] = None,
         credential_provider: Optional[CredentialProvider] = None,
@@ -244,6 +524,10 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         cache: Optional[CacheInterface] = None,
         cache_config: Optional[CacheConfig] = None,
         event_dispatcher: Optional[EventDispatcher] = None,
+        maint_notifications_config: Optional[MaintNotificationsConfig] = None,
+        oss_cluster_maint_notifications_handler: Optional[
+            OSSMaintNotificationsHandler
+        ] = None,
     ) -> None:
         """
         Initialize a new Redis client.
@@ -271,6 +555,31 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         single_connection_client:
             if `True`, connection pool is not used. In that case `Redis`
             instance use is not thread safe.
+        decode_responses:
+            if `True`, the response will be decoded to utf-8.
+            Argument is ignored when connection_pool is provided.
+        driver_info:
+            Optional DriverInfo object to identify upstream libraries.
+            If provided, lib_name and lib_version are ignored.
+            If not provided, a DriverInfo will be created from lib_name and lib_version.
+            Argument is ignored when connection_pool is provided.
+        lib_name:
+            **Deprecated.** Use driver_info instead. Library name for CLIENT SETINFO.
+        lib_version:
+            **Deprecated.** Use driver_info instead. Library version for CLIENT SETINFO.
+        maint_notifications_config:
+            configures the pool to support maintenance notifications - see
+            `redis.maint_notifications.MaintNotificationsConfig` for details.
+            Only supported with RESP3
+            If not provided and protocol is RESP3, the maintenance notifications
+            will be enabled by default (logic is included in the connection pool
+            initialization).
+            Argument is ignored when connection_pool is provided.
+        oss_cluster_maint_notifications_handler:
+            handler for OSS cluster notifications - see
+            `redis.maint_notifications.OSSMaintNotificationsHandler` for details.
+            Only supported with RESP3
+            Argument is ignored when connection_pool is provided.
         """
         if event_dispatcher is None:
             self._event_dispatcher = EventDispatcher()
@@ -279,6 +588,12 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         if not connection_pool:
             if not retry_on_error:
                 retry_on_error = []
+
+            # Handle driver_info: if provided, use it; otherwise create from lib_name/lib_version
+            computed_driver_info = resolve_driver_info(
+                driver_info, lib_name, lib_version
+            )
+
             kwargs = {
                 "db": db,
                 "username": username,
@@ -292,8 +607,7 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
                 "max_connections": max_connections,
                 "health_check_interval": health_check_interval,
                 "client_name": client_name,
-                "lib_name": lib_name,
-                "lib_version": lib_version,
+                "driver_info": computed_driver_info,
                 "redis_connect_func": redis_connect_func,
                 "credential_provider": credential_provider,
                 "protocol": protocol,
@@ -325,6 +639,8 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
                             "ssl_keyfile": ssl_keyfile,
                             "ssl_certfile": ssl_certfile,
                             "ssl_cert_reqs": ssl_cert_reqs,
+                            "ssl_include_verify_flags": ssl_include_verify_flags,
+                            "ssl_exclude_verify_flags": ssl_exclude_verify_flags,
                             "ssl_ca_certs": ssl_ca_certs,
                             "ssl_ca_data": ssl_ca_data,
                             "ssl_check_hostname": ssl_check_hostname,
@@ -338,11 +654,33 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
                             "ssl_ciphers": ssl_ciphers,
                         }
                     )
-                if (cache_config or cache) and protocol in [3, "3"]:
+                if (cache_config or cache) and check_protocol_version(protocol, 3):
                     kwargs.update(
                         {
                             "cache": cache,
                             "cache_config": cache_config,
+                        }
+                    )
+                maint_notifications_enabled = (
+                    maint_notifications_config and maint_notifications_config.enabled
+                )
+                if maint_notifications_enabled and protocol not in [
+                    3,
+                    "3",
+                ]:
+                    raise RedisError(
+                        "Maintenance notifications handlers on connection are only supported with RESP version 3"
+                    )
+                if maint_notifications_config:
+                    kwargs.update(
+                        {
+                            "maint_notifications_config": maint_notifications_config,
+                        }
+                    )
+                if oss_cluster_maint_notifications_handler:
+                    kwargs.update(
+                        {
+                            "oss_cluster_maint_notifications_handler": oss_cluster_maint_notifications_handler,
                         }
                     )
             connection_pool = ConnectionPool(**kwargs)
@@ -368,7 +706,7 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         ]:
             raise RedisError("Client caching is only supported with RESP version 3")
 
-        self.single_connection_lock = threading.Lock()
+        self.single_connection_lock = threading.RLock()
         self.connection = None
         self._single_connection_client = single_connection_client
         if self._single_connection_client:
@@ -448,7 +786,7 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
 
     def transaction(
         self, func: Callable[["Pipeline"], None], *watches, **kwargs
-    ) -> None:
+    ) -> Union[List[Any], Any, None]:
         """
         Convenience method for executing the callable `func` as a transaction
         while watching all keys specified in `watches`. The 'func' callable
@@ -566,7 +904,8 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
 
     def client(self):
         return self.__class__(
-            connection_pool=self.connection_pool, single_connection_client=True
+            connection_pool=self.connection_pool,
+            single_connection_client=True,
         )
 
     def __enter__(self):
@@ -603,7 +942,14 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         conn.send_command(*args, **options)
         return self.parse_response(conn, command_name, **options)
 
-    def _close_connection(self, conn) -> None:
+    def _close_connection(
+        self,
+        conn,
+        error: Optional[Exception] = None,
+        failure_count: Optional[int] = None,
+        start_time: Optional[float] = None,
+        command_name: Optional[str] = None,
+    ) -> None:
         """
         Close the connection before retrying.
 
@@ -613,6 +959,16 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         After we disconnect the connection, it will try to reconnect and
         do a health check as part of the send_command logic(on connection level).
         """
+        if error and failure_count <= conn.retry.get_retries():
+            record_operation_duration(
+                command_name=command_name,
+                duration_seconds=time.monotonic() - start_time,
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                db_namespace=str(conn.db),
+                error=error,
+                retry_attempts=failure_count,
+            )
 
         conn.disconnect()
 
@@ -626,16 +982,52 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         command_name = args[0]
         conn = self.connection or pool.get_connection()
 
+        # Start timing for observability
+        start_time = time.monotonic()
+        # Track actual retry attempts for error reporting
+        actual_retry_attempts = [0]
+
+        def failure_callback(error, failure_count):
+            if is_debug_log_enabled():
+                add_debug_log_for_operation_failure(conn)
+            actual_retry_attempts[0] = failure_count
+            self._close_connection(conn, error, failure_count, start_time, command_name)
+
         if self._single_connection_client:
             self.single_connection_lock.acquire()
         try:
-            return conn.retry.call_with_retry(
+            result = conn.retry.call_with_retry(
                 lambda: self._send_command_parse_response(
                     conn, command_name, *args, **options
                 ),
-                lambda _: self._close_connection(conn),
+                failure_callback,
+                with_failure_count=True,
             )
+
+            record_operation_duration(
+                command_name=command_name,
+                duration_seconds=time.monotonic() - start_time,
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                db_namespace=str(conn.db),
+            )
+            return result
+        except Exception as e:
+            record_error_count(
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                network_peer_address=getattr(conn, "host", None),
+                network_peer_port=getattr(conn, "port", None),
+                error_type=e,
+                retry_attempts=actual_retry_attempts[0],
+                is_internal=False,
+            )
+            raise
+
         finally:
+            if conn and conn.should_reconnect():
+                self._close_connection(conn)
+                conn.connect()
             if self._single_connection_client:
                 self.single_connection_lock.release()
             if not self.connection:
@@ -686,11 +1078,7 @@ class Monitor:
         self.connection = self.connection_pool.get_connection()
 
     def __enter__(self):
-        self.connection.send_command("MONITOR")
-        # check that monitor returns 'OK', but don't return it to user
-        response = self.connection.read_response()
-        if not bool_ok(response):
-            raise RedisError(f"MONITOR failed: {response}")
+        self._start_monitor()
         return self
 
     def __exit__(self, *args):
@@ -700,8 +1088,13 @@ class Monitor:
     def next_command(self):
         """Parse the response from a monitor command"""
         response = self.connection.read_response()
+
+        if response is None:
+            return None
+
         if isinstance(response, bytes):
             response = self.connection.encoder.decode(response, force=True)
+
         command_time, command_data = response.split(" ", 1)
         m = self.monitor_re.match(command_data)
         db_id, client_info, command = m.groups()
@@ -720,9 +1113,14 @@ class Monitor:
             client_port = client_info[5:]
             client_type = "unix"
         else:
-            # use rsplit as ipv6 addresses contain colons
-            client_address, client_port = client_info.rsplit(":", 1)
-            client_type = "tcp"
+            if client_info == "":
+                client_address = ""
+                client_port = ""
+                client_type = "unknown"
+            else:
+                # use rsplit as ipv6 addresses contain colons
+                client_address, client_port = client_info.rsplit(":", 1)
+                client_type = "tcp"
         return {
             "time": float(command_time),
             "db": int(db_id),
@@ -736,6 +1134,14 @@ class Monitor:
         """Listen for commands coming to the server."""
         while True:
             yield self.next_command()
+
+    def _start_monitor(self):
+        self.connection.send_command("MONITOR")
+        # check that monitor returns 'OK', but don't return it to user
+        response = self.connection.read_response()
+
+        if not bool_ok(response):
+            raise RedisError(f"MONITOR failed: {response}")
 
 
 class PubSub:
@@ -773,7 +1179,8 @@ class PubSub:
             self._event_dispatcher = EventDispatcher()
         else:
             self._event_dispatcher = event_dispatcher
-        self._lock = threading.Lock()
+
+        self._lock = threading.RLock()
         if self.encoder is None:
             self.encoder = self.connection_pool.get_encoder()
         self.health_check_response_b = self.encoder.encode(self.HEALTH_CHECK_MESSAGE)
@@ -823,25 +1230,45 @@ class PubSub:
         # NOTE: for python3, we can't pass bytestrings as keyword arguments
         # so we need to decode channel/pattern names back to unicode strings
         # before passing them to [p]subscribe.
+        #
+        # However, channels subscribed without a callback (positional args) may
+        # have binary names that are not valid in the current encoding (e.g.
+        # arbitrary bytes that are not valid UTF-8).  These channels are stored
+        # with a ``None`` handler.  We re-subscribe them as positional args so
+        # that no decoding is required.
         self.pending_unsubscribe_channels.clear()
         self.pending_unsubscribe_patterns.clear()
         self.pending_unsubscribe_shard_channels.clear()
         if self.channels:
-            channels = {
-                self.encoder.decode(k, force=True): v for k, v in self.channels.items()
-            }
-            self.subscribe(**channels)
+            channels_with_handlers = {}
+            channels_without_handlers = []
+            for k, v in self.channels.items():
+                if v is not None:
+                    channels_with_handlers[self.encoder.decode(k, force=True)] = v
+                else:
+                    channels_without_handlers.append(k)
+            if channels_with_handlers or channels_without_handlers:
+                self.subscribe(*channels_without_handlers, **channels_with_handlers)
         if self.patterns:
-            patterns = {
-                self.encoder.decode(k, force=True): v for k, v in self.patterns.items()
-            }
-            self.psubscribe(**patterns)
+            patterns_with_handlers = {}
+            patterns_without_handlers = []
+            for k, v in self.patterns.items():
+                if v is not None:
+                    patterns_with_handlers[self.encoder.decode(k, force=True)] = v
+                else:
+                    patterns_without_handlers.append(k)
+            if patterns_with_handlers or patterns_without_handlers:
+                self.psubscribe(*patterns_without_handlers, **patterns_with_handlers)
         if self.shard_channels:
-            shard_channels = {
-                self.encoder.decode(k, force=True): v
-                for k, v in self.shard_channels.items()
-            }
-            self.ssubscribe(**shard_channels)
+            shard_with_handlers = {}
+            shard_without_handlers = []
+            for k, v in self.shard_channels.items():
+                if v is not None:
+                    shard_with_handlers[self.encoder.decode(k, force=True)] = v
+                else:
+                    shard_without_handlers.append(k)
+            if shard_with_handlers or shard_without_handlers:
+                self.ssubscribe(*shard_without_handlers, **shard_with_handlers)
 
     @property
     def subscribed(self) -> bool:
@@ -860,7 +1287,7 @@ class PubSub:
             # register a callback that re-subscribes to any channels we
             # were listening to when we were disconnected
             self.connection.register_connect_callback(self.on_connect)
-            if self.push_handler_func is not None and not HIREDIS_AVAILABLE:
+            if self.push_handler_func is not None:
                 self.connection._parser.set_pubsub_push_handler(self.push_handler_func)
             self._event_dispatcher.dispatch(
                 AfterPubSubConnectionInstantiationEvent(
@@ -880,7 +1307,7 @@ class PubSub:
         """
         ttl = 10
         conn = self.connection
-        while self.health_check_response_counter > 0 and ttl > 0:
+        while conn and self.health_check_response_counter > 0 and ttl > 0:
             if self._execute(conn, conn.can_read, timeout=conn.socket_timeout):
                 response = self._execute(conn, conn.read_response)
                 if self.is_health_check_response(response):
@@ -892,13 +1319,31 @@ class PubSub:
                     )
             ttl -= 1
 
-    def _reconnect(self, conn) -> None:
+    def _reconnect(
+        self,
+        conn,
+        error: Optional[Exception] = None,
+        failure_count: Optional[int] = None,
+        start_time: Optional[float] = None,
+        command_name: Optional[str] = None,
+    ) -> None:
         """
         The supported exceptions are already checked in the
         retry object so we don't need to do it here.
 
         In this error handler we are trying to reconnect to the server.
         """
+        if error and failure_count <= conn.retry.get_retries():
+            if command_name:
+                record_operation_duration(
+                    command_name=command_name,
+                    duration_seconds=time.monotonic() - start_time,
+                    server_address=getattr(conn, "host", None),
+                    server_port=getattr(conn, "port", None),
+                    db_namespace=str(conn.db),
+                    error=error,
+                    retry_attempts=failure_count,
+                )
         conn.disconnect()
         conn.connect()
 
@@ -910,13 +1355,92 @@ class PubSub:
         called by the # connection to resubscribe us to any channels and
         patterns we were previously listening to
         """
-        return conn.retry.call_with_retry(
-            lambda: command(*args, **kwargs),
-            lambda _: self._reconnect(conn),
-        )
+
+        if conn.should_reconnect():
+            self._reconnect(conn)
+
+        if not len(args) == 0:
+            command_name = args[0]
+        else:
+            command_name = None
+
+        # Start timing for observability
+        start_time = time.monotonic()
+        # Track actual retry attempts for error reporting
+        actual_retry_attempts = [0]
+
+        def failure_callback(error, failure_count):
+            actual_retry_attempts[0] = failure_count
+            self._reconnect(conn, error, failure_count, start_time, command_name)
+
+        try:
+            response = conn.retry.call_with_retry(
+                lambda: command(*args, **kwargs),
+                failure_callback,
+                with_failure_count=True,
+            )
+
+            if command_name:
+                record_operation_duration(
+                    command_name=command_name,
+                    duration_seconds=time.monotonic() - start_time,
+                    server_address=getattr(conn, "host", None),
+                    server_port=getattr(conn, "port", None),
+                    db_namespace=str(conn.db),
+                )
+
+            return response
+        except Exception as e:
+            record_error_count(
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                network_peer_address=getattr(conn, "host", None),
+                network_peer_port=getattr(conn, "port", None),
+                error_type=e,
+                retry_attempts=actual_retry_attempts[0],
+                is_internal=False,
+            )
+            raise
 
     def parse_response(self, block=True, timeout=0):
-        """Parse the response from a publish/subscribe command"""
+        """
+        Parse the response from a publish/subscribe command.
+
+        Args:
+            block: If True, block indefinitely until a message is available.
+                   If False, return immediately if no message is available.
+                   Default: True
+            timeout: The timeout in seconds for reading a response when block=False.
+                     This parameter is ignored when block=True.
+                     Default: 0 (return immediately if no data available)
+
+        Returns:
+            The parsed response from the server, or None if no message is available
+            within the timeout period (when block=False).
+
+        Important:
+            The block and timeout parameters work together:
+            - When block=True: timeout is IGNORED, method blocks indefinitely
+            - When block=False: timeout is USED, method returns after timeout expires
+
+            Typically, you should use get_message(timeout=X) instead of calling
+            parse_response() directly. The get_message() method automatically sets
+            block=False when a timeout is provided, and block=True when timeout=None.
+
+        Example:
+            # Block indefinitely (timeout is ignored)
+            response = pubsub.parse_response(block=True, timeout=0.1)
+
+            # Non-blocking with 0.1 second timeout
+            response = pubsub.parse_response(block=False, timeout=0.1)
+
+            # Non-blocking, return immediately
+            response = pubsub.parse_response(block=False, timeout=0)
+
+            # Recommended: use get_message() instead
+            msg = pubsub.get_message(timeout=0.1)  # automatically sets block=False
+            msg = pubsub.get_message(timeout=None)  # automatically sets block=True
+        """
         conn = self.connection
         if conn is None:
             raise RuntimeError(
@@ -930,9 +1454,13 @@ class PubSub:
             if not block:
                 if not conn.can_read(timeout=timeout):
                     return None
+                read_timeout = timeout
             else:
                 conn.connect()
-            return conn.read_response(disconnect_on_error=False, push_request=True)
+                read_timeout = SENTINEL  # Use default socket timeout for blocking
+            return conn.read_response(
+                disconnect_on_error=False, push_request=True, timeout=read_timeout
+            )
 
         response = self._execute(conn, try_read)
 
@@ -948,10 +1476,22 @@ class PubSub:
         If there are no subscriptions redis responds to PING command with a
         bulk response, instead of a multi-bulk with "pong" and the response.
         """
-        return response in [
-            self.health_check_response,  # If there was a subscription
-            self.health_check_response_b,  # If there wasn't
-        ]
+        if self.encoder.decode_responses:
+            return (
+                response
+                in [
+                    self.health_check_response,  # If there is a subscription
+                    self.HEALTH_CHECK_MESSAGE,  # If there are no subscriptions and decode_responses=True
+                ]
+            )
+        else:
+            return (
+                response
+                in [
+                    self.health_check_response,  # If there is a subscription
+                    self.health_check_response_b,  # If there isn't a subscription and decode_responses=False
+                ]
+            )
 
     def check_health(self) -> None:
         conn = self.connection
@@ -1124,6 +1664,7 @@ class PubSub:
                 return None
 
         response = self.parse_response(block=(timeout is None), timeout=timeout)
+
         if response:
             return self.handle_message(response, ignore_subscribe_messages)
         return None
@@ -1132,7 +1673,10 @@ class PubSub:
 
     def ping(self, message: Union[str, None] = None) -> bool:
         """
-        Ping the Redis server
+        Ping the Redis server to test connectivity.
+
+        Sends a PING command to the Redis server and returns True if the server
+        responds with "PONG".
         """
         args = ["PING", message] if message is not None else ["PING"]
         return self.execute_command(*args)
@@ -1147,6 +1691,7 @@ class PubSub:
             return None
         if isinstance(response, bytes):
             response = [b"pong", response] if response != b"PONG" else [b"pong", b""]
+
         message_type = str_if_bytes(response[0])
         if message_type == "pmessage":
             message = {
@@ -1169,6 +1714,20 @@ class PubSub:
                 "channel": response[1],
                 "data": response[2],
             }
+
+        if message_type in ["message", "pmessage"]:
+            channel = str_if_bytes(message["channel"])
+            record_pubsub_message(
+                direction=PubSubDirection.RECEIVE,
+                channel=channel,
+            )
+        elif message_type == "smessage":
+            channel = str_if_bytes(message["channel"])
+            record_pubsub_message(
+                direction=PubSubDirection.RECEIVE,
+                channel=channel,
+                sharded=True,
+            )
 
         # if this is an unsubscribe message, remove it from memory
         if message_type in self.UNSUBSCRIBE_MESSAGE_TYPES:
@@ -1216,6 +1775,8 @@ class PubSub:
         sleep_time: float = 0.0,
         daemon: bool = False,
         exception_handler: Optional[Callable] = None,
+        pubsub=None,
+        sharded_pubsub: bool = False,
     ) -> "PubSubWorkerThread":
         for channel, handler in self.channels.items():
             if handler is None:
@@ -1229,8 +1790,13 @@ class PubSub:
                     f"Shard Channel: '{s_channel}' has no handler registered"
                 )
 
+        pubsub = self if pubsub is None else pubsub
         thread = PubSubWorkerThread(
-            self, sleep_time, daemon=daemon, exception_handler=exception_handler
+            pubsub,
+            sleep_time,
+            daemon=daemon,
+            exception_handler=exception_handler,
+            sharded_pubsub=sharded_pubsub,
         )
         thread.start()
         return thread
@@ -1245,12 +1811,14 @@ class PubSubWorkerThread(threading.Thread):
         exception_handler: Union[
             Callable[[Exception, "PubSub", "PubSubWorkerThread"], None], None
         ] = None,
+        sharded_pubsub: bool = False,
     ):
         super().__init__()
         self.daemon = daemon
         self.pubsub = pubsub
         self.sleep_time = sleep_time
         self.exception_handler = exception_handler
+        self.sharded_pubsub = sharded_pubsub
         self._running = threading.Event()
 
     def run(self) -> None:
@@ -1261,7 +1829,14 @@ class PubSubWorkerThread(threading.Thread):
         sleep_time = self.sleep_time
         while self._running.is_set():
             try:
-                pubsub.get_message(ignore_subscribe_messages=True, timeout=sleep_time)
+                if not self.sharded_pubsub:
+                    pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=sleep_time
+                    )
+                else:
+                    pubsub.get_sharded_message(
+                        ignore_subscribe_messages=True, timeout=sleep_time
+                    )
             except BaseException as e:
                 if self.exception_handler is None:
                     raise
@@ -1297,9 +1872,15 @@ class Pipeline(Redis):
 
     UNWATCH_COMMANDS = {"DISCARD", "EXEC", "UNWATCH"}
 
-    def __init__(self, connection_pool, response_callbacks, transaction, shard_hint):
+    def __init__(
+        self,
+        connection_pool: ConnectionPool,
+        response_callbacks,
+        transaction,
+        shard_hint,
+    ):
         self.connection_pool = connection_pool
-        self.connection = None
+        self.connection: Optional[Connection] = None
         self.response_callbacks = response_callbacks
         self.transaction = transaction
         self.shard_hint = shard_hint
@@ -1344,6 +1925,7 @@ class Pipeline(Redis):
         # clean up the other instance attributes
         self.watching = False
         self.explicit_transaction = False
+
         # we can safely return the connection to the pool here since we're
         # sure we're no longer WATCHing anything
         if self.connection:
@@ -1376,6 +1958,9 @@ class Pipeline(Redis):
         self,
         conn: AbstractConnection,
         error: Exception,
+        failure_count: Optional[int] = None,
+        start_time: Optional[float] = None,
+        command_name: Optional[str] = None,
     ) -> None:
         """
         Close the connection reset watching state and
@@ -1387,6 +1972,16 @@ class Pipeline(Redis):
         After we disconnect the connection, it will try to reconnect and
         do a health check as part of the send_command logic(on connection level).
         """
+        if error and failure_count <= conn.retry.get_retries():
+            record_operation_duration(
+                command_name=command_name,
+                duration_seconds=time.monotonic() - start_time,
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                db_namespace=str(conn.db),
+                error=error,
+                retry_attempts=failure_count,
+            )
         conn.disconnect()
 
         # if we were already watching a variable, the watch is no longer
@@ -1412,12 +2007,48 @@ class Pipeline(Redis):
             conn = self.connection_pool.get_connection()
             self.connection = conn
 
-        return conn.retry.call_with_retry(
-            lambda: self._send_command_parse_response(
-                conn, command_name, *args, **options
-            ),
-            lambda error: self._disconnect_reset_raise_on_watching(conn, error),
-        )
+        # Start timing for observability
+        start_time = time.monotonic()
+        # Track actual retry attempts for error reporting
+        actual_retry_attempts = [0]
+
+        def failure_callback(error, failure_count):
+            if is_debug_log_enabled():
+                add_debug_log_for_operation_failure(conn)
+            actual_retry_attempts[0] = failure_count
+            self._disconnect_reset_raise_on_watching(
+                conn, error, failure_count, start_time, command_name
+            )
+
+        try:
+            response = conn.retry.call_with_retry(
+                lambda: self._send_command_parse_response(
+                    conn, command_name, *args, **options
+                ),
+                failure_callback,
+                with_failure_count=True,
+            )
+
+            record_operation_duration(
+                command_name=command_name,
+                duration_seconds=time.monotonic() - start_time,
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                db_namespace=str(conn.db),
+            )
+
+            return response
+        except Exception as e:
+            record_error_count(
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                network_peer_address=getattr(conn, "host", None),
+                network_peer_port=getattr(conn, "port", None),
+                error_type=e,
+                retry_attempts=actual_retry_attempts[0],
+                is_internal=False,
+            )
+            raise
 
     def pipeline_execute_command(self, *args, **options) -> "Pipeline":
         """
@@ -1434,7 +2065,9 @@ class Pipeline(Redis):
         self.command_stack.append((args, options))
         return self
 
-    def _execute_transaction(self, connection, commands, raise_on_error) -> List:
+    def _execute_transaction(
+        self, connection: Connection, commands, raise_on_error
+    ) -> List:
         cmds = chain([(("MULTI",), {})], commands, [(("EXEC",), {})])
         all_cmds = connection.pack_commands(
             [args for args, options in cmds if EMPTY_RESPONSE not in options]
@@ -1501,6 +2134,7 @@ class Pipeline(Redis):
                 if command_name in self.response_callbacks:
                     r = self.response_callbacks[command_name](r, **options)
             data.append(r)
+
         return data
 
     def _execute_pipeline(self, connection, commands, raise_on_error):
@@ -1508,16 +2142,17 @@ class Pipeline(Redis):
         all_cmds = connection.pack_commands([args for args, _ in commands])
         connection.send_packed_command(all_cmds)
 
-        response = []
+        responses = []
         for args, options in commands:
             try:
-                response.append(self.parse_response(connection, args[0], **options))
+                responses.append(self.parse_response(connection, args[0], **options))
             except ResponseError as e:
-                response.append(e)
+                responses.append(e)
 
         if raise_on_error:
-            self.raise_first_error(commands, response)
-        return response
+            self.raise_first_error(commands, responses)
+
+        return responses
 
     def raise_first_error(self, commands, response):
         for i, r in enumerate(response):
@@ -1558,6 +2193,9 @@ class Pipeline(Redis):
         self,
         conn: AbstractConnection,
         error: Exception,
+        failure_count: Optional[int] = None,
+        start_time: Optional[float] = None,
+        command_name: Optional[str] = None,
     ) -> None:
         """
         Close the connection, raise an exception if we were watching.
@@ -1568,6 +2206,16 @@ class Pipeline(Redis):
         After we disconnect the connection, it will try to reconnect and
         do a health check as part of the send_command logic(on connection level).
         """
+        if error and failure_count <= conn.retry.get_retries():
+            record_operation_duration(
+                command_name=command_name,
+                duration_seconds=time.monotonic() - start_time,
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                db_namespace=str(conn.db),
+                error=error,
+                retry_attempts=failure_count,
+            )
         conn.disconnect()
         # if we were watching a variable, the watch is no longer valid
         # since this connection has died. raise a WatchError, which
@@ -1586,8 +2234,10 @@ class Pipeline(Redis):
             self.load_scripts()
         if self.transaction or self.explicit_transaction:
             execute = self._execute_transaction
+            operation_name = "MULTI"
         else:
             execute = self._execute_pipeline
+            operation_name = "PIPELINE"
 
         conn = self.connection
         if not conn:
@@ -1596,12 +2246,49 @@ class Pipeline(Redis):
             # back to the pool after we're done
             self.connection = conn
 
-        try:
-            return conn.retry.call_with_retry(
-                lambda: execute(conn, stack, raise_on_error),
-                lambda error: self._disconnect_raise_on_watching(conn, error),
+        # Start timing for observability
+        start_time = time.monotonic()
+        # Track actual retry attempts for error reporting
+        actual_retry_attempts = [0]
+
+        def failure_callback(error, failure_count):
+            if is_debug_log_enabled():
+                add_debug_log_for_operation_failure(conn)
+            actual_retry_attempts[0] = failure_count
+            self._disconnect_raise_on_watching(
+                conn, error, failure_count, start_time, operation_name
             )
+
+        try:
+            response = conn.retry.call_with_retry(
+                lambda: execute(conn, stack, raise_on_error),
+                failure_callback,
+                with_failure_count=True,
+            )
+
+            record_operation_duration(
+                command_name=operation_name,
+                duration_seconds=time.monotonic() - start_time,
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                db_namespace=str(conn.db),
+            )
+            return response
+        except Exception as e:
+            record_error_count(
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                network_peer_address=getattr(conn, "host", None),
+                network_peer_port=getattr(conn, "port", None),
+                error_type=e,
+                retry_attempts=actual_retry_attempts[0],
+                is_internal=False,
+            )
+            raise
+
         finally:
+            # in reset() the connection is disconnected before returned to the pool if
+            # it is marked for reconnect.
             self.reset()
 
     def discard(self):

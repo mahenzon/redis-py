@@ -3,8 +3,8 @@
 The Python interface to the Redis key-value store.
 
 [![CI](https://github.com/redis/redis-py/workflows/CI/badge.svg?branch=master)](https://github.com/redis/redis-py/actions?query=workflow%3ACI+branch%3Amaster)
-[![docs](https://readthedocs.org/projects/redis/badge/?version=stable&style=flat)](https://redis-py.readthedocs.io/en/stable/)
-[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![docs](https://readthedocs.org/projects/redis/badge/?version=stable&style=flat)](https://redis.readthedocs.io/en/stable/)
+[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/redis/redis-py/blob/master/LICENSE)
 [![pypi](https://badge.fury.io/py/redis.svg)](https://pypi.org/project/redis/)
 [![pre-release](https://img.shields.io/github/v/release/redis/redis-py?include_prereleases&label=latest-prerelease)](https://github.com/redis/redis-py/releases)
 [![codecov](https://codecov.io/gh/redis/redis-py/branch/master/graph/badge.svg?token=yenl5fzxxr)](https://codecov.io/gh/redis/redis-py)
@@ -13,7 +13,8 @@ The Python interface to the Redis key-value store.
 
 ---------------------------------------------
 
-**Note:** redis-py 5.0 will be the last version of redis-py to support Python 3.7, as it has reached [end of life](https://devguide.python.org/versions/). redis-py 5.1 will support Python 3.8+.
+**Note:** redis-py 5.0 is the last version of redis-py that supports Python 3.7, as it has reached [end of life](https://devguide.python.org/versions/). redis-py 5.1 supports Python 3.8+.<br>
+**Note:** redis-py 6.1.0 is the last version of redis-py that supports Python 3.8, as it has reached [end of life](https://devguide.python.org/versions/). redis-py 6.2.0 supports Python 3.9+.
 
 ---------------------------------------------
 
@@ -31,12 +32,17 @@ The Python interface to the Redis key-value store.
 
 ## Installation
 
-Start a redis via docker:
+Start a redis via docker (for Redis versions >= 8.0):
+
+``` bash
+docker run -p 6379:6379 -it redis:latest
+```
+
+Start a redis via docker (for Redis versions < 8.0):
 
 ``` bash
 docker run -p 6379:6379 -it redis/redis-stack:latest
 ```
-
 To install redis-py, simply:
 
 ``` bash
@@ -54,7 +60,7 @@ Looking for a high-level library to handle object mapping? See [redis-om-python]
 
 ## Supported Redis Versions
 
-The most recent version of this library supports redis version [5.0](https://github.com/redis/redis/blob/5.0/00-RELEASENOTES), [6.0](https://github.com/redis/redis/blob/6.0/00-RELEASENOTES), [6.2](https://github.com/redis/redis/blob/6.2/00-RELEASENOTES), [7.0](https://github.com/redis/redis/blob/7.0/00-RELEASENOTES), [7.2](https://github.com/redis/redis/blob/7.2/00-RELEASENOTES) and [7.4](https://github.com/redis/redis/blob/7.4/00-RELEASENOTES).
+The most recent version of this library supports Redis version [7.2](https://github.com/redis/redis/blob/7.2/00-RELEASENOTES), [7.4](https://github.com/redis/redis/blob/7.4/00-RELEASENOTES), [8.0](https://github.com/redis/redis/blob/8.0/00-RELEASENOTES) and [8.2](https://github.com/redis/redis/blob/8.2/00-RELEASENOTES).
 
 The table below highlights version compatibility of the most-recent library versions and redis versions.
 
@@ -62,7 +68,8 @@ The table below highlights version compatibility of the most-recent library vers
 |-----------------|-------------------|
 | 3.5.3 | <= 6.2 Family of releases |
 | >= 4.5.0 | Version 5.0 to 7.0 |
-| >= 5.0.0 | Version 5.0 to current |
+| >= 5.0.0 | Version 5.0 to 7.4 |
+| >= 6.0.0 | Version 7.2 to current |
 
 
 ## Usage
@@ -152,8 +159,52 @@ The following example shows how to utilize [Redis Pub/Sub](https://redis.io/docs
 {'pattern': None, 'type': 'subscribe', 'channel': b'my-second-channel', 'data': 1}
 ```
 
+### Redis’ search and query capabilities default dialect
 
---------------------------
+Release 6.0.0 introduces a client-side default dialect for Redis’ search and query capabilities.
+By default, the client now overrides the server-side dialect with version 2, automatically appending *DIALECT 2* to commands like *FT.AGGREGATE* and *FT.SEARCH*.
+
+**Important**: Be aware that the query dialect may impact the results returned. If needed, you can revert to a different dialect version by configuring the client accordingly.
+
+``` python
+>>> from redis.commands.search.field import TextField
+>>> from redis.commands.search.query import Query
+>>> from redis.commands.search.index_definition import IndexDefinition
+>>> import redis
+
+>>> r = redis.Redis(host='localhost', port=6379, db=0)
+>>> r.ft().create_index(
+>>>     (TextField("name"), TextField("lastname")),
+>>>     definition=IndexDefinition(prefix=["test:"]),
+>>> )
+
+>>> r.hset("test:1", "name", "James")
+>>> r.hset("test:1", "lastname", "Brown")
+
+>>> # Query with default DIALECT 2
+>>> query = "@name: James Brown"
+>>> q = Query(query)
+>>> res = r.ft().search(q)
+
+>>> # Query with explicit DIALECT 1
+>>> query = "@name: James Brown"
+>>> q = Query(query).dialect(1)
+>>> res = r.ft().search(q)
+```
+
+You can find further details in the [query dialect documentation](https://redis.io/docs/latest/develop/interact/search-and-query/advanced-concepts/dialects/).
+
+### Multi-database client (Active-Active)
+
+The multi-database client allows your application to connect to multiple Redis databases, which are typically replicas of each other. It is designed to work with Redis Software and Redis Cloud Active-Active setups. The client continuously monitors database health, detects failures, and automatically fails over to the next healthy database using a configurable strategy. When the original database becomes healthy again, the client can automatically switch back to it.<br>
+This is useful when:
+
+1. You have more than one Redis deployment. This might include two independent Redis servers or two or more Redis databases replicated across multiple [active-active Redis Enterprise](https://redis.io/docs/latest/operate/rs/databases/active-active/) clusters.
+2. You want your application to connect to one deployment at a time and to fail over to the next available deployment if the first deployment becomes unavailable.
+
+For the complete failover configuration options and examples, see the [Multi-database client docs](https://redis.readthedocs.io/en/latest/multi_database.html).
+
+---------------------------------------------
 
 ### Author
 
@@ -169,4 +220,4 @@ Special thanks to:
     system.
 -   Paul Hubbard for initial packaging support.
 
-[![Redis](./docs/_static/logo-redis.svg)](https://redis.io)
+[![Redis](https://github.com/redis/redis-py/blob/master/docs/_static/logo-redis.svg)](https://redis.io)

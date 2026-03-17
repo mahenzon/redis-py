@@ -2,6 +2,7 @@ import asyncio
 import copy
 import inspect
 import re
+import time
 import warnings
 from typing import (
     TYPE_CHECKING,
@@ -12,6 +13,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Literal,
     Mapping,
     MutableMapping,
     Optional,
@@ -23,6 +25,7 @@ from typing import (
     TypeVar,
     Union,
     cast,
+    overload,
 )
 
 from redis._parsers.helpers import (
@@ -38,6 +41,11 @@ from redis.asyncio.connection import (
     UnixDomainSocketConnection,
 )
 from redis.asyncio.lock import Lock
+from redis.asyncio.observability.recorder import (
+    record_error_count,
+    record_operation_duration,
+    record_pubsub_message,
+)
 from redis.asyncio.retry import Retry
 from redis.backoff import ExponentialWithJitterBackoff
 from redis.client import (
@@ -53,6 +61,7 @@ from redis.commands import (
     list_or_args,
 )
 from redis.credentials import CredentialProvider
+from redis.driver_info import DriverInfo, resolve_driver_info
 from redis.event import (
     AfterPooledConnectionsInstantiationEvent,
     AfterPubSubConnectionInstantiationEvent,
@@ -68,29 +77,53 @@ from redis.exceptions import (
     ResponseError,
     WatchError,
 )
-from redis.typing import ChannelT, EncodableT, KeyT
+from redis.observability.attributes import PubSubDirection
+from redis.typing import (
+    ChannelT,
+    EncodableT,
+    KeyT,
+    ResponseTypeAnyString,
+    ResponseTypeListOfAnyOptionalStrings,
+    ResponseTypeListOfAnyStrings,
+    ResponseTypeLPopRPop,
+    ResponseTypeOptionalAnyString,
+    ResponseTypeOptionalListOfAnyStrings,
+    ResponseTypeOptionalLMPop,
+)
 from redis.utils import (
-    HIREDIS_AVAILABLE,
     SSL_AVAILABLE,
     _set_info_logger,
     deprecated_args,
     deprecated_function,
-    get_lib_version,
     safe_str,
     str_if_bytes,
     truncate_text,
 )
 
 if TYPE_CHECKING and SSL_AVAILABLE:
-    from ssl import TLSVersion, VerifyMode
+    from ssl import TLSVersion, VerifyFlags, VerifyMode
 else:
     TLSVersion = None
     VerifyMode = None
+    VerifyFlags = None
+
+if TYPE_CHECKING:
+    import sys
+
+    if sys.version_info < (3, 11):
+        from typing_extensions import Self
+    else:
+        from typing import Self
+
+    from redis.asyncio.typing import (
+        RedisDecoded,
+        RedisEncoded,
+        RedisEncodedOrDecoded,
+    )
 
 PubSubHandler = Callable[[Dict[str, str]], Awaitable[None]]
 _KeyT = TypeVar("_KeyT", bound=KeyT)
 _ArgT = TypeVar("_ArgT", KeyT, EncodableT)
-_RedisT = TypeVar("_RedisT", bound="Redis")
 _NormalizeKeysT = TypeVar("_NormalizeKeysT", bound=Mapping[ChannelT, object])
 if TYPE_CHECKING:
     from redis.commands.core import Script
@@ -108,7 +141,18 @@ ResponseCallbackT = Union[ResponseCallbackProtocol, AsyncResponseCallbackProtoco
 
 
 class Redis(
-    AbstractRedis, AsyncRedisModuleCommands, AsyncCoreCommands, AsyncSentinelCommands
+    AbstractRedis,
+    AsyncRedisModuleCommands,
+    AsyncCoreCommands[
+        ResponseTypeAnyString,
+        ResponseTypeOptionalAnyString,
+        ResponseTypeListOfAnyStrings,
+        ResponseTypeListOfAnyOptionalStrings,
+        ResponseTypeOptionalListOfAnyStrings,
+        ResponseTypeOptionalLMPop,
+        ResponseTypeLPopRPop,
+    ],
+    AsyncSentinelCommands,
 ):
     """
     Implementation of the Redis protocol.
@@ -124,14 +168,66 @@ class Redis(
 
     response_callbacks: MutableMapping[Union[str, bytes], ResponseCallbackT]
 
+    # Overload for decode_responses=True
+    @overload
     @classmethod
     def from_url(
         cls,
         url: str,
         single_connection_client: bool = False,
         auto_close_connection_pool: Optional[bool] = None,
-        **kwargs,
-    ):
+        *,
+        decode_responses: Literal[True],
+        **kwargs: Any,
+    ) -> "RedisDecoded": ...
+
+    # Overload for decode_responses=False
+    @overload
+    @classmethod
+    def from_url(
+        cls,
+        url: str,
+        single_connection_client: bool = False,
+        auto_close_connection_pool: Optional[bool] = None,
+        *,
+        decode_responses: Literal[False],
+        **kwargs: Any,
+    ) -> "RedisEncoded": ...
+
+    # Overload for decode_responses passed as bool
+    @overload
+    @classmethod
+    def from_url(
+        cls,
+        url: str,
+        single_connection_client: bool = False,
+        auto_close_connection_pool: Optional[bool] = None,
+        *,
+        decode_responses: bool,
+        **kwargs: Any,
+    ) -> "RedisEncodedOrDecoded": ...
+
+    # Overload for no decode_responses passed - by default False
+    @overload
+    @classmethod
+    def from_url(
+        cls,
+        url: str,
+        single_connection_client: bool = False,
+        auto_close_connection_pool: Optional[bool] = None,
+        **kwargs: Any,
+    ) -> "RedisEncoded": ...
+
+    @classmethod
+    def from_url(
+        cls: Type["RedisEncoded"]
+        | Type["RedisDecoded"]
+        | Type["RedisEncodedOrDecoded"],
+        url: str,
+        single_connection_client: bool = False,
+        auto_close_connection_pool: Optional[bool] = None,
+        **kwargs: Any,
+    ) -> "RedisEncoded | RedisDecoded | RedisEncodedOrDecoded":
         """
         Return a Redis client object configured from the given URL
 
@@ -195,9 +291,9 @@ class Redis(
 
     @classmethod
     def from_pool(
-        cls: Type["Redis"],
+        cls,
         connection_pool: ConnectionPool,
-    ) -> "Redis":
+    ) -> "RedisEncoded | RedisDecoded | RedisEncodedOrDecoded":
         """
         Return a Redis client from the given connection pool.
         The Redis client will take ownership of the connection pool and
@@ -209,10 +305,165 @@ class Redis(
         client.auto_close_connection_pool = True
         return client
 
+    # Overload for decode_responses=True
+    @overload
+    def __init__(
+        self: "RedisDecoded",
+        *,
+        host: str = "localhost",
+        port: int = 6379,
+        db: Union[str, int] = 0,
+        password: Optional[str] = None,
+        socket_timeout: Optional[float] = None,
+        socket_connect_timeout: Optional[float] = None,
+        socket_keepalive: Optional[bool] = None,
+        socket_keepalive_options: Optional[Mapping[int, Union[int, bytes]]] = None,
+        connection_pool: Optional[ConnectionPool] = None,
+        unix_socket_path: Optional[str] = None,
+        encoding: str = "utf-8",
+        encoding_errors: str = "strict",
+        decode_responses: Literal[True],
+        retry: Retry = Retry(
+            backoff=ExponentialWithJitterBackoff(base=1, cap=10), retries=3
+        ),
+        retry_on_error: Optional[list[Type[Exception]]] = None,
+        ssl: bool = False,
+        ssl_keyfile: Optional[str] = None,
+        ssl_certfile: Optional[str] = None,
+        ssl_cert_reqs: Union[str, VerifyMode] = "required",
+        ssl_include_verify_flags: Optional[List[VerifyFlags]] = None,
+        ssl_exclude_verify_flags: Optional[List[VerifyFlags]] = None,
+        ssl_ca_certs: Optional[str] = None,
+        ssl_ca_data: Optional[str] = None,
+        ssl_ca_path: Optional[str] = None,
+        ssl_check_hostname: bool = True,
+        ssl_min_version: Optional[TLSVersion] = None,
+        ssl_ciphers: Optional[str] = None,
+        ssl_password: Optional[str] = None,
+        max_connections: Optional[int] = None,
+        single_connection_client: bool = False,
+        health_check_interval: int = 0,
+        client_name: Optional[str] = None,
+        lib_name: Optional[str] = None,
+        lib_version: Optional[str] = None,
+        driver_info: Optional["DriverInfo"] = None,
+        username: Optional[str] = None,
+        auto_close_connection_pool: Optional[bool] = None,
+        redis_connect_func=None,
+        credential_provider: Optional[CredentialProvider] = None,
+        protocol: Optional[int] = 2,
+        event_dispatcher: Optional[EventDispatcher] = None,
+    ) -> None: ...
+
+    # Default case - decode_responses=False
+    @overload
+    def __init__(
+        self: "RedisEncoded",
+        *,
+        host: str = "localhost",
+        port: int = 6379,
+        db: Union[str, int] = 0,
+        password: Optional[str] = None,
+        socket_timeout: Optional[float] = None,
+        socket_connect_timeout: Optional[float] = None,
+        socket_keepalive: Optional[bool] = None,
+        socket_keepalive_options: Optional[Mapping[int, Union[int, bytes]]] = None,
+        connection_pool: Optional[ConnectionPool] = None,
+        unix_socket_path: Optional[str] = None,
+        encoding: str = "utf-8",
+        encoding_errors: str = "strict",
+        decode_responses: Literal[False] = False,
+        retry: Retry = Retry(
+            backoff=ExponentialWithJitterBackoff(base=1, cap=10), retries=3
+        ),
+        retry_on_error: Optional[list[Type[Exception]]] = None,
+        ssl: bool = False,
+        ssl_keyfile: Optional[str] = None,
+        ssl_certfile: Optional[str] = None,
+        ssl_cert_reqs: Union[str, VerifyMode] = "required",
+        ssl_include_verify_flags: Optional[List[VerifyFlags]] = None,
+        ssl_exclude_verify_flags: Optional[List[VerifyFlags]] = None,
+        ssl_ca_certs: Optional[str] = None,
+        ssl_ca_data: Optional[str] = None,
+        ssl_ca_path: Optional[str] = None,
+        ssl_check_hostname: bool = True,
+        ssl_min_version: Optional[TLSVersion] = None,
+        ssl_ciphers: Optional[str] = None,
+        ssl_password: Optional[str] = None,
+        max_connections: Optional[int] = None,
+        single_connection_client: bool = False,
+        health_check_interval: int = 0,
+        client_name: Optional[str] = None,
+        lib_name: Optional[str] = None,
+        lib_version: Optional[str] = None,
+        driver_info: Optional["DriverInfo"] = None,
+        username: Optional[str] = None,
+        auto_close_connection_pool: Optional[bool] = None,
+        redis_connect_func=None,
+        credential_provider: Optional[CredentialProvider] = None,
+        protocol: Optional[int] = 2,
+        event_dispatcher: Optional[EventDispatcher] = None,
+    ) -> None: ...
+
+    # Runtime bool
+    @overload
+    def __init__(
+        self: "RedisEncodedOrDecoded",
+        *,
+        host: str = "localhost",
+        port: int = 6379,
+        db: Union[str, int] = 0,
+        password: Optional[str] = None,
+        socket_timeout: Optional[float] = None,
+        socket_connect_timeout: Optional[float] = None,
+        socket_keepalive: Optional[bool] = None,
+        socket_keepalive_options: Optional[Mapping[int, Union[int, bytes]]] = None,
+        connection_pool: Optional[ConnectionPool] = None,
+        unix_socket_path: Optional[str] = None,
+        encoding: str = "utf-8",
+        encoding_errors: str = "strict",
+        decode_responses: bool = False,
+        retry: Retry = Retry(
+            backoff=ExponentialWithJitterBackoff(base=1, cap=10), retries=3
+        ),
+        retry_on_error: Optional[list[Type[Exception]]] = None,
+        ssl: bool = False,
+        ssl_keyfile: Optional[str] = None,
+        ssl_certfile: Optional[str] = None,
+        ssl_cert_reqs: Union[str, VerifyMode] = "required",
+        ssl_include_verify_flags: Optional[List[VerifyFlags]] = None,
+        ssl_exclude_verify_flags: Optional[List[VerifyFlags]] = None,
+        ssl_ca_certs: Optional[str] = None,
+        ssl_ca_data: Optional[str] = None,
+        ssl_ca_path: Optional[str] = None,
+        ssl_check_hostname: bool = True,
+        ssl_min_version: Optional[TLSVersion] = None,
+        ssl_ciphers: Optional[str] = None,
+        ssl_password: Optional[str] = None,
+        max_connections: Optional[int] = None,
+        single_connection_client: bool = False,
+        health_check_interval: int = 0,
+        client_name: Optional[str] = None,
+        lib_name: Optional[str] = None,
+        lib_version: Optional[str] = None,
+        driver_info: Optional["DriverInfo"] = None,
+        username: Optional[str] = None,
+        auto_close_connection_pool: Optional[bool] = None,
+        redis_connect_func=None,
+        credential_provider: Optional[CredentialProvider] = None,
+        protocol: Optional[int] = 2,
+        event_dispatcher: Optional[EventDispatcher] = None,
+    ) -> None: ...
+
     @deprecated_args(
         args_to_warn=["retry_on_timeout"],
         reason="TimeoutError is included by default.",
         version="6.0.0",
+    )
+    @deprecated_args(
+        args_to_warn=["lib_name", "lib_version"],
+        reason="Use 'driver_info' parameter instead. "
+        "lib_name and lib_version will be removed in a future version.",
     )
     def __init__(
         self,
@@ -234,22 +485,27 @@ class Redis(
         retry: Retry = Retry(
             backoff=ExponentialWithJitterBackoff(base=1, cap=10), retries=3
         ),
-        retry_on_error: Optional[list] = None,
+        retry_on_error: Optional[list[Type[Exception]]] = None,
         ssl: bool = False,
         ssl_keyfile: Optional[str] = None,
         ssl_certfile: Optional[str] = None,
         ssl_cert_reqs: Union[str, VerifyMode] = "required",
+        ssl_include_verify_flags: Optional[List[VerifyFlags]] = None,
+        ssl_exclude_verify_flags: Optional[List[VerifyFlags]] = None,
         ssl_ca_certs: Optional[str] = None,
         ssl_ca_data: Optional[str] = None,
+        ssl_ca_path: Optional[str] = None,
         ssl_check_hostname: bool = True,
         ssl_min_version: Optional[TLSVersion] = None,
         ssl_ciphers: Optional[str] = None,
+        ssl_password: Optional[str] = None,
         max_connections: Optional[int] = None,
         single_connection_client: bool = False,
         health_check_interval: int = 0,
         client_name: Optional[str] = None,
-        lib_name: Optional[str] = "redis-py",
-        lib_version: Optional[str] = get_lib_version(),
+        lib_name: Optional[str] = None,
+        lib_version: Optional[str] = None,
+        driver_info: Optional["DriverInfo"] = None,
         username: Optional[str] = None,
         auto_close_connection_pool: Optional[bool] = None,
         redis_connect_func=None,
@@ -302,6 +558,12 @@ class Redis(
             # Create internal connection pool, expected to be closed by Redis instance
             if not retry_on_error:
                 retry_on_error = []
+
+            # Handle driver_info: if provided, use it; otherwise create from lib_name/lib_version
+            computed_driver_info = resolve_driver_info(
+                driver_info, lib_name, lib_version
+            )
+
             kwargs = {
                 "db": db,
                 "username": username,
@@ -316,8 +578,7 @@ class Redis(
                 "max_connections": max_connections,
                 "health_check_interval": health_check_interval,
                 "client_name": client_name,
-                "lib_name": lib_name,
-                "lib_version": lib_version,
+                "driver_info": computed_driver_info,
                 "redis_connect_func": redis_connect_func,
                 "protocol": protocol,
             }
@@ -348,11 +609,15 @@ class Redis(
                             "ssl_keyfile": ssl_keyfile,
                             "ssl_certfile": ssl_certfile,
                             "ssl_cert_reqs": ssl_cert_reqs,
+                            "ssl_include_verify_flags": ssl_include_verify_flags,
+                            "ssl_exclude_verify_flags": ssl_exclude_verify_flags,
                             "ssl_ca_certs": ssl_ca_certs,
                             "ssl_ca_data": ssl_ca_data,
+                            "ssl_ca_path": ssl_ca_path,
                             "ssl_check_hostname": ssl_check_hostname,
                             "ssl_min_version": ssl_min_version,
                             "ssl_ciphers": ssl_ciphers,
+                            "ssl_password": ssl_password,
                         }
                     )
             # This arg only used if no pool is passed in
@@ -388,6 +653,12 @@ class Redis(
         # on a set of redis commands
         self._single_conn_lock = asyncio.Lock()
 
+        # When used as an async context manager, we need to increment and decrement
+        # a usage counter so that we can close the connection pool when no one is
+        # using the client.
+        self._usage_counter = 0
+        self._usage_lock = asyncio.Lock()
+
     def __repr__(self):
         return (
             f"<{self.__class__.__module__}.{self.__class__.__name__}"
@@ -397,7 +668,7 @@ class Redis(
     def __await__(self):
         return self.initialize().__await__()
 
-    async def initialize(self: _RedisT) -> _RedisT:
+    async def initialize(self) -> "Self":
         if self.single_connection_client:
             async with self._single_conn_lock:
                 if self.connection is None:
@@ -594,11 +865,48 @@ class Redis(
             connection_pool=self.connection_pool, single_connection_client=True
         )
 
-    async def __aenter__(self: _RedisT) -> _RedisT:
-        return await self.initialize()
+    async def __aenter__(self) -> "Self":
+        """
+        Async context manager entry. Increments a usage counter so that the
+        connection pool is only closed (via aclose()) when no context is using
+        the client.
+        """
+        await self._increment_usage()
+        try:
+            # Initialize the client (i.e. establish connection, etc.)
+            return await self.initialize()
+        except Exception:
+            # If initialization fails, decrement the counter to keep it in sync
+            await self._decrement_usage()
+            raise
+
+    async def _increment_usage(self) -> int:
+        """
+        Helper coroutine to increment the usage counter while holding the lock.
+        Returns the new value of the usage counter.
+        """
+        async with self._usage_lock:
+            self._usage_counter += 1
+            return self._usage_counter
+
+    async def _decrement_usage(self) -> int:
+        """
+        Helper coroutine to decrement the usage counter while holding the lock.
+        Returns the new value of the usage counter.
+        """
+        async with self._usage_lock:
+            self._usage_counter -= 1
+            return self._usage_counter
 
     async def __aexit__(self, exc_type, exc_value, traceback):
-        await self.aclose()
+        """
+        Async context manager exit. Decrements a usage counter. If this is the
+        last exit (counter becomes zero), the client closes its connection pool.
+        """
+        current_usage = await asyncio.shield(self._decrement_usage())
+        if current_usage == 0:
+            # This was the last active context, so disconnect the pool.
+            await asyncio.shield(self.aclose())
 
     _DEL_MESSAGE = "Unclosed Redis client"
 
@@ -652,7 +960,14 @@ class Redis(
         await conn.send_command(*args)
         return await self.parse_response(conn, command_name, **options)
 
-    async def _close_connection(self, conn: Connection):
+    async def _close_connection(
+        self,
+        conn: Connection,
+        error: Optional[BaseException] = None,
+        failure_count: Optional[int] = None,
+        start_time: Optional[float] = None,
+        command_name: Optional[str] = None,
+    ):
         """
         Close the connection before retrying.
 
@@ -662,7 +977,22 @@ class Redis(
         After we disconnect the connection, it will try to reconnect and
         do a health check as part of the send_command logic(on connection level).
         """
-        await conn.disconnect()
+        if (
+            error
+            and failure_count is not None
+            and failure_count <= conn.retry.get_retries()
+        ):
+            await record_operation_duration(
+                command_name=command_name,
+                duration_seconds=time.monotonic() - start_time,
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                db_namespace=str(conn.db),
+                error=error,
+                retry_attempts=failure_count,
+            )
+
+        await conn.disconnect(error=error, failure_count=failure_count)
 
     # COMMAND EXECUTION AND PROTOCOL PARSING
     async def execute_command(self, *args, **options):
@@ -672,15 +1002,48 @@ class Redis(
         command_name = args[0]
         conn = self.connection or await pool.get_connection()
 
+        # Start timing for observability
+        start_time = time.monotonic()
+        # Track actual retry attempts for error reporting
+        actual_retry_attempts = 0
+
+        def failure_callback(error, failure_count):
+            nonlocal actual_retry_attempts
+            actual_retry_attempts = failure_count
+            return self._close_connection(
+                conn, error, failure_count, start_time, command_name
+            )
+
         if self.single_connection_client:
             await self._single_conn_lock.acquire()
         try:
-            return await conn.retry.call_with_retry(
+            result = await conn.retry.call_with_retry(
                 lambda: self._send_command_parse_response(
                     conn, command_name, *args, **options
                 ),
-                lambda _: self._close_connection(conn),
+                failure_callback,
+                with_failure_count=True,
             )
+
+            await record_operation_duration(
+                command_name=command_name,
+                duration_seconds=time.monotonic() - start_time,
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                db_namespace=str(conn.db),
+            )
+            return result
+        except Exception as e:
+            await record_error_count(
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                network_peer_address=getattr(conn, "host", None),
+                network_peer_port=getattr(conn, "port", None),
+                error_type=e,
+                retry_attempts=actual_retry_attempts,
+                is_internal=False,
+            )
+            raise
         finally:
             if self.single_connection_client:
                 self._single_conn_lock.release()
@@ -810,8 +1173,8 @@ class PubSub:
     will be returned and it's safe to start listening again.
     """
 
-    PUBLISH_MESSAGE_TYPES = ("message", "pmessage")
-    UNSUBSCRIBE_MESSAGE_TYPES = ("unsubscribe", "punsubscribe")
+    PUBLISH_MESSAGE_TYPES = ("message", "pmessage", "smessage")
+    UNSUBSCRIBE_MESSAGE_TYPES = ("unsubscribe", "punsubscribe", "sunsubscribe")
     HEALTH_CHECK_MESSAGE = "redis-py-health-check"
 
     def __init__(
@@ -897,18 +1260,38 @@ class PubSub:
         # NOTE: for python3, we can't pass bytestrings as keyword arguments
         # so we need to decode channel/pattern names back to unicode strings
         # before passing them to [p]subscribe.
+        #
+        # However, channels subscribed without a callback (positional args) may
+        # have binary names that are not valid in the current encoding (e.g.
+        # arbitrary bytes that are not valid UTF-8).  These channels are stored
+        # with a ``None`` handler.  We re-subscribe them as positional args so
+        # that no decoding is required.
         self.pending_unsubscribe_channels.clear()
         self.pending_unsubscribe_patterns.clear()
         if self.channels:
-            channels = {}
+            channels_with_handlers = {}
+            channels_without_handlers = []
             for k, v in self.channels.items():
-                channels[self.encoder.decode(k, force=True)] = v
-            await self.subscribe(**channels)
+                if v is not None:
+                    channels_with_handlers[self.encoder.decode(k, force=True)] = v
+                else:
+                    channels_without_handlers.append(k)
+            if channels_with_handlers or channels_without_handlers:
+                await self.subscribe(
+                    *channels_without_handlers, **channels_with_handlers
+                )
         if self.patterns:
-            patterns = {}
+            patterns_with_handlers = {}
+            patterns_without_handlers = []
             for k, v in self.patterns.items():
-                patterns[self.encoder.decode(k, force=True)] = v
-            await self.psubscribe(**patterns)
+                if v is not None:
+                    patterns_with_handlers[self.encoder.decode(k, force=True)] = v
+                else:
+                    patterns_without_handlers.append(k)
+            if patterns_with_handlers or patterns_without_handlers:
+                await self.psubscribe(
+                    *patterns_without_handlers, **patterns_with_handlers
+                )
 
     @property
     def subscribed(self):
@@ -938,7 +1321,7 @@ class PubSub:
             self.connection.register_connect_callback(self.on_connect)
         else:
             await self.connection.connect()
-        if self.push_handler_func is not None and not HIREDIS_AVAILABLE:
+        if self.push_handler_func is not None:
             self.connection._parser.set_pubsub_push_handler(self.push_handler_func)
 
         self._event_dispatcher.dispatch(
@@ -947,11 +1330,36 @@ class PubSub:
             )
         )
 
-    async def _reconnect(self, conn):
+    async def _reconnect(
+        self,
+        conn,
+        error: Optional[BaseException] = None,
+        failure_count: Optional[int] = None,
+        start_time: Optional[float] = None,
+        command_name: Optional[str] = None,
+    ):
         """
-        Try to reconnect
+        The supported exceptions are already checked in the
+        retry object so we don't need to do it here.
+
+        In this error handler we are trying to reconnect to the server.
         """
-        await conn.disconnect()
+        if (
+            error
+            and failure_count is not None
+            and failure_count <= conn.retry.get_retries()
+        ):
+            if command_name:
+                await record_operation_duration(
+                    command_name=command_name,
+                    duration_seconds=time.monotonic() - start_time,
+                    server_address=getattr(conn, "host", None),
+                    server_port=getattr(conn, "port", None),
+                    db_namespace=str(conn.db),
+                    error=error,
+                    retry_attempts=failure_count,
+                )
+        await conn.disconnect(error=error, failure_count=failure_count)
         await conn.connect()
 
     async def _execute(self, conn, command, *args, **kwargs):
@@ -962,13 +1370,89 @@ class PubSub:
         called by the # connection to resubscribe us to any channels and
         patterns we were previously listening to
         """
-        return await conn.retry.call_with_retry(
-            lambda: command(*args, **kwargs),
-            lambda _: self._reconnect(conn),
-        )
+        if not len(args) == 0:
+            command_name = args[0]
+        else:
+            command_name = None
+
+        # Start timing for observability
+        start_time = time.monotonic()
+        # Track actual retry attempts for error reporting
+        actual_retry_attempts = 0
+
+        def failure_callback(error, failure_count):
+            nonlocal actual_retry_attempts
+            actual_retry_attempts = failure_count
+            return self._reconnect(conn, error, failure_count, start_time, command_name)
+
+        try:
+            response = await conn.retry.call_with_retry(
+                lambda: command(*args, **kwargs),
+                failure_callback,
+                with_failure_count=True,
+            )
+
+            if command_name:
+                await record_operation_duration(
+                    command_name=command_name,
+                    duration_seconds=time.monotonic() - start_time,
+                    server_address=getattr(conn, "host", None),
+                    server_port=getattr(conn, "port", None),
+                    db_namespace=str(conn.db),
+                )
+
+            return response
+        except Exception as e:
+            await record_error_count(
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                network_peer_address=getattr(conn, "host", None),
+                network_peer_port=getattr(conn, "port", None),
+                error_type=e,
+                retry_attempts=actual_retry_attempts,
+                is_internal=False,
+            )
+            raise
 
     async def parse_response(self, block: bool = True, timeout: float = 0):
-        """Parse the response from a publish/subscribe command"""
+        """
+        Parse the response from a publish/subscribe command.
+
+        Args:
+            block: If True, block indefinitely until a message is available.
+                   If False, return immediately if no message is available.
+                   Default: True
+            timeout: The timeout in seconds for reading a response when block=False.
+                     This parameter is ignored when block=True.
+                     Default: 0 (return immediately if no data available)
+
+        Returns:
+            The parsed response from the server, or None if no message is available
+            within the timeout period (when block=False).
+
+        Important:
+            The block and timeout parameters work together:
+            - When block=True: timeout is IGNORED, method blocks indefinitely
+            - When block=False: timeout is USED, method returns after timeout expires
+
+            Typically, you should use get_message(timeout=X) instead of calling
+            parse_response() directly. The get_message() method automatically sets
+            block=False when a timeout is provided, and block=True when timeout=None.
+
+        Example:
+            # Block indefinitely (timeout is ignored)
+            response = await pubsub.parse_response(block=True, timeout=0.1)
+
+            # Non-blocking with 0.1 second timeout
+            response = await pubsub.parse_response(block=False, timeout=0.1)
+
+            # Non-blocking, return immediately
+            response = await pubsub.parse_response(block=False, timeout=0)
+
+            # Recommended: use get_message() instead
+            msg = await pubsub.get_message(timeout=0.1)  # automatically sets block=False
+            msg = await pubsub.get_message(timeout=None)  # automatically sets block=True
+        """
         conn = self.connection
         if conn is None:
             raise RuntimeError(
@@ -1114,9 +1598,12 @@ class PubSub:
             return await self.handle_message(response, ignore_subscribe_messages)
         return None
 
-    def ping(self, message=None) -> Awaitable:
+    def ping(self, message=None) -> Awaitable[bool]:
         """
-        Ping the Redis server
+        Ping the Redis server to test connectivity.
+
+        Sends a PING command to the Redis server and returns True if the server
+        responds with "PONG".
         """
         args = ["PING", message] if message is not None else ["PING"]
         return self.execute_command(*args)
@@ -1153,6 +1640,13 @@ class PubSub:
                 "channel": response[1],
                 "data": response[2],
             }
+
+        if message_type in ["message", "pmessage"]:
+            channel = str_if_bytes(message["channel"])
+            await record_pubsub_message(
+                direction=PubSubDirection.RECEIVE,
+                channel=channel,
+            )
 
         # if this is an unsubscribe message, remove it from memory
         if message_type in self.UNSUBSCRIBE_MESSAGE_TYPES:
@@ -1192,6 +1686,7 @@ class PubSub:
         *,
         exception_handler: Optional["PSWorkerThreadExcHandlerT"] = None,
         poll_timeout: float = 1.0,
+        pubsub=None,
     ) -> None:
         """Process pub/sub messages using registered callbacks.
 
@@ -1216,9 +1711,14 @@ class PubSub:
         await self.connect()
         while True:
             try:
-                await self.get_message(
-                    ignore_subscribe_messages=True, timeout=poll_timeout
-                )
+                if pubsub is None:
+                    await self.get_message(
+                        ignore_subscribe_messages=True, timeout=poll_timeout
+                    )
+                else:
+                    await pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=poll_timeout
+                    )
             except asyncio.CancelledError:
                 raise
             except BaseException as e:
@@ -1288,7 +1788,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         self.scripts: Set[Script] = set()
         self.explicit_transaction = False
 
-    async def __aenter__(self: _RedisT) -> _RedisT:
+    async def __aenter__(self) -> "Self":
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback):
@@ -1361,7 +1861,10 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         self,
         conn: Connection,
         error: Exception,
-    ):
+        failure_count: Optional[int] = None,
+        start_time: Optional[float] = None,
+        command_name: Optional[str] = None,
+    ) -> None:
         """
         Close the connection reset watching state and
         raise an exception if we were watching.
@@ -1372,7 +1875,21 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         After we disconnect the connection, it will try to reconnect and
         do a health check as part of the send_command logic(on connection level).
         """
-        await conn.disconnect()
+        if (
+            error
+            and failure_count is not None
+            and failure_count <= conn.retry.get_retries()
+        ):
+            await record_operation_duration(
+                command_name=command_name,
+                duration_seconds=time.monotonic() - start_time,
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                db_namespace=str(conn.db),
+                error=error,
+                retry_attempts=failure_count,
+            )
+        await conn.disconnect(error=error, failure_count=failure_count)
         # if we were already watching a variable, the watch is no longer
         # valid since this connection has died. raise a WatchError, which
         # indicates the user should retry this transaction.
@@ -1396,12 +1913,47 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
             conn = await self.connection_pool.get_connection()
             self.connection = conn
 
-        return await conn.retry.call_with_retry(
-            lambda: self._send_command_parse_response(
-                conn, command_name, *args, **options
-            ),
-            lambda error: self._disconnect_reset_raise_on_watching(conn, error),
-        )
+        # Start timing for observability
+        start_time = time.monotonic()
+        # Track actual retry attempts for error reporting
+        actual_retry_attempts = 0
+
+        def failure_callback(error, failure_count):
+            nonlocal actual_retry_attempts
+            actual_retry_attempts = failure_count
+            return self._disconnect_reset_raise_on_watching(
+                conn, error, failure_count, start_time, command_name
+            )
+
+        try:
+            response = await conn.retry.call_with_retry(
+                lambda: self._send_command_parse_response(
+                    conn, command_name, *args, **options
+                ),
+                failure_callback,
+                with_failure_count=True,
+            )
+
+            await record_operation_duration(
+                command_name=command_name,
+                duration_seconds=time.monotonic() - start_time,
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                db_namespace=str(conn.db),
+            )
+
+            return response
+        except Exception as e:
+            await record_error_count(
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                network_peer_address=getattr(conn, "host", None),
+                network_peer_port=getattr(conn, "port", None),
+                error_type=e,
+                retry_attempts=actual_retry_attempts,
+                is_internal=False,
+            )
+            raise
 
     def pipeline_execute_command(self, *args, **options):
         """
@@ -1528,7 +2080,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         cmd = " ".join(map(safe_str, command))
         msg = (
             f"Command # {number} ({truncate_text(cmd)}) "
-            "of pipeline caused error: {exception.args}"
+            f"of pipeline caused error: {exception.args}"
         )
         exception.args = (msg,) + exception.args[1:]
 
@@ -1555,7 +2107,14 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                 if not exist:
                     s.sha = await immediate("SCRIPT LOAD", s.script)
 
-    async def _disconnect_raise_on_watching(self, conn: Connection, error: Exception):
+    async def _disconnect_raise_on_watching(
+        self,
+        conn: Connection,
+        error: Exception,
+        failure_count: Optional[int] = None,
+        start_time: Optional[float] = None,
+        command_name: Optional[str] = None,
+    ):
         """
         Close the connection, raise an exception if we were watching.
 
@@ -1565,7 +2124,21 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         After we disconnect the connection, it will try to reconnect and
         do a health check as part of the send_command logic(on connection level).
         """
-        await conn.disconnect()
+        if (
+            error
+            and failure_count is not None
+            and failure_count <= conn.retry.get_retries()
+        ):
+            await record_operation_duration(
+                command_name=command_name,
+                duration_seconds=time.monotonic() - start_time,
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                db_namespace=str(conn.db),
+                error=error,
+                retry_attempts=failure_count,
+            )
+        await conn.disconnect(error=error, failure_count=failure_count)
         # if we were watching a variable, the watch is no longer valid
         # since this connection has died. raise a WatchError, which
         # indicates the user should retry this transaction.
@@ -1583,8 +2156,10 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
             await self.load_scripts()
         if self.is_transaction or self.explicit_transaction:
             execute = self._execute_transaction
+            operation_name = "MULTI"
         else:
             execute = self._execute_pipeline
+            operation_name = "PIPELINE"
 
         conn = self.connection
         if not conn:
@@ -1594,11 +2169,44 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
             self.connection = conn
         conn = cast(Connection, conn)
 
-        try:
-            return await conn.retry.call_with_retry(
-                lambda: execute(conn, stack, raise_on_error),
-                lambda error: self._disconnect_raise_on_watching(conn, error),
+        # Start timing for observability
+        start_time = time.monotonic()
+        # Track actual retry attempts for error reporting
+        actual_retry_attempts = 0
+
+        def failure_callback(error, failure_count):
+            nonlocal actual_retry_attempts
+            actual_retry_attempts = failure_count
+            return self._disconnect_raise_on_watching(
+                conn, error, failure_count, start_time, operation_name
             )
+
+        try:
+            response = await conn.retry.call_with_retry(
+                lambda: execute(conn, stack, raise_on_error),
+                failure_callback,
+                with_failure_count=True,
+            )
+
+            await record_operation_duration(
+                command_name=operation_name,
+                duration_seconds=time.monotonic() - start_time,
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                db_namespace=str(conn.db),
+            )
+            return response
+        except Exception as e:
+            await record_error_count(
+                server_address=getattr(conn, "host", None),
+                server_port=getattr(conn, "port", None),
+                network_peer_address=getattr(conn, "host", None),
+                network_peer_port=getattr(conn, "port", None),
+                error_type=e,
+                retry_attempts=actual_retry_attempts,
+                is_internal=False,
+            )
+            raise
         finally:
             await self.reset()
 

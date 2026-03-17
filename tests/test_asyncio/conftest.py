@@ -1,6 +1,7 @@
 import random
 from contextlib import asynccontextmanager as _asynccontextmanager
 from typing import Union
+from unittest import mock
 
 import pytest
 import pytest_asyncio
@@ -13,8 +14,6 @@ from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
 from redis.credentials import CredentialProvider
 from tests.conftest import REDIS_INFO, get_credential_provider
-
-from .compat import mock
 
 
 async def _get_info(redis_url):
@@ -149,6 +148,9 @@ def _gen_cluster_mock_resp(r, response):
     connection = mock.AsyncMock(spec=Connection)
     connection.retry = Retry(NoBackoff(), 0)
     connection.read_response.return_value = response
+    connection.host = "localhost"
+    connection.port = 6379
+    connection.db = 0
     with mock.patch.object(r, "connection", connection):
         yield r
 
